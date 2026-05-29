@@ -1180,7 +1180,7 @@ def run_analyze_entry(llm: Llama,
         t0         = time.perf_counter()
         prompt     = build_analyze_entry_prompt(batch)
         pt         = approx_tokens(prompt)
-        max_tokens = n * 120   # 1-2 sentence summary — give generous budget
+        max_tokens = n * 250   # Mistral writes longer summaries than smaller models
 
         if pt + max_tokens > LLM_CONFIG["n_ctx"] * 0.90:
             log.warning(f"Batch {batch_num}: prompt~{pt}tok near context limit")
