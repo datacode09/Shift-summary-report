@@ -1000,19 +1000,32 @@ def parse_batch_response(raw: str, expected: int,
     required = {"id", "should_include", "summary", "priority",
                 "ieso_notified", "ieso_notification_time"}
 
-    def validate(arr) -> Optional[list[dict]]:
-        if not isinstance(arr, list) or len(arr) != expected:
+    def validate_objects(arr, partial: bool = False) -> Optional[list[dict]]:
+        """
+        Validate a list of parsed JSON objects.
+        partial=True: accept fewer than expected records (caller fills gaps via id_map).
+        partial=False: require exactly expected records (full-batch strategies only).
+        """
+        if not isinstance(arr, list) or len(arr) == 0:
             return None
+        if not partial and len(arr) != expected:
+            return None
+        valid = []
         for obj in arr:
-            if not isinstance(obj, dict): return None
-            if not required.issubset(obj.keys()): return None
-            if str(obj.get("priority","")).upper() not in VALID_PRIORITIES:
-                return None
-        return arr
+            if not isinstance(obj, dict): continue
+            if not required.issubset(obj.keys()): continue
+            if str(obj.get("priority","")).upper() not in VALID_PRIORITIES: continue
+            valid.append(obj)
+        if len(valid) == 0:
+            return None
+        # For full-batch strategies: still require exact count
+        if not partial and len(valid) != expected:
+            return None
+        return valid
 
     # Strategy 1: direct parse
     try:
-        result = validate(json.loads(raw))
+        result = validate_objects(json.loads(raw))
         if result: return result
     except Exception: pass
 
@@ -1020,21 +1033,29 @@ def parse_batch_response(raw: str, expected: int,
     try:
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         if m:
-            result = validate(json.loads(m.group()))
+            result = validate_objects(json.loads(m.group()))
             if result: return result
     except Exception: pass
 
-    # Strategy 3: find all {...} objects and assemble array
+    # Strategy 3: find all complete {...} objects — also accepts partial batches.
+    # This is the main recovery path when the LLM stops mid-array (EOS truncation).
+    # The caller (run_analyze_entry) already handles missing IDs via id_map + safe_default.
     try:
         objects = []
         for m in re.finditer(r"\{[^{}]+\}", raw, re.DOTALL):
             try:
                 obj = json.loads(m.group())
                 if required.issubset(obj.keys()):
-                    objects.append(obj)
+                    if str(obj.get("priority","")).upper() in VALID_PRIORITIES:
+                        objects.append(obj)
             except Exception: pass
-        result = validate(objects)
-        if result: return result
+        if objects:
+            if len(objects) < expected:
+                log.warning(f"Batch {batch_num}: recovered {len(objects)}/{expected} records "
+                            f"(LLM truncated output); missing IDs will get safe default")
+                return objects   # partial — caller fills gaps
+            result = validate_objects(objects)
+            if result: return result
     except Exception: pass
 
     # Strategy 4: fix common LLM JSON mistakes and retry
@@ -1047,11 +1068,26 @@ def parse_batch_response(raw: str, expected: int,
         fixed = re.sub(r"None", "null", fixed)
         m = re.search(r"\[.*\]", fixed, re.DOTALL)
         if m:
-            result = validate(json.loads(m.group()))
+            result = validate_objects(json.loads(m.group()))
             if result: return result
     except Exception: pass
 
-    log.error(f"Batch {batch_num}: all 4 parse strategies failed. "
+    # Strategy 5: truncated-array recovery — LLM stopped mid-JSON with no closing ']'.
+    # Try appending common suffixes to close the array and parse what we have.
+    try:
+        stripped = raw.strip().rstrip(",")
+        if stripped.startswith("[") and not stripped.endswith("]"):
+            for suffix in ("}]", "]"):
+                try:
+                    candidate = validate_objects(json.loads(stripped + suffix), partial=True)
+                    if candidate:
+                        log.warning(f"Batch {batch_num}: truncation-patched {len(candidate)}/{expected} "
+                                    f"records; missing IDs will get safe default")
+                        return candidate
+                except Exception: pass
+    except Exception: pass
+
+    log.error(f"Batch {batch_num}: all 5 parse strategies failed. "
               f"Raw ({len(raw)} chars): {raw[:300]!r}")
     return None
 
@@ -1109,7 +1145,7 @@ def run_analyze_entry(llm: Llama,
         t0         = time.perf_counter()
         prompt     = build_analyze_entry_prompt(batch)
         pt         = approx_tokens(prompt)
-        max_tokens = n * 120   # 1-2 sentence summary — give generous budget
+        max_tokens = n * 220   # ~150 chars summary + JSON overhead per record
 
         if pt + max_tokens > LLM_CONFIG["n_ctx"] * 0.90:
             log.warning(f"Batch {batch_num}: prompt~{pt}tok near context limit")
