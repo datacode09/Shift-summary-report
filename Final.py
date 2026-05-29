@@ -215,7 +215,7 @@ SHIFT_DATE       = _shift_cfg.get("shift_date",       None)  # "YYYY-MM-DD" or n
 # ── LLM settings (from config.json) ──────────────────────────────────────────
 LLM_BATCH_SIZE    = _cfg.get("llm_batch_size",    10)
 MAX_COMMENT_CHARS = _cfg.get("max_comment_chars", 400)
-DEV_MODE          = _cfg.get("dev_mode",          True)
+DEV_MODE          = _cfg.get("dev_mode",          False)
 N_THREADS         = _cfg.get("n_threads",         4)
 N_BATCH           = _cfg.get("n_batch",           512)
 
@@ -1041,7 +1041,7 @@ def parse_batch_response(raw: str, expected: int,
     try:
         fixed = raw
         fixed = re.sub(r",\s*([}\]])", r"\1", fixed)   # trailing commas
-        fixed = re.sub(r"'", '"', fixed)                # single → double quotes
+        fixed = re.sub(r"(?<!\w)'|'(?!\w)", '"', fixed) # single → double quotes (skip apostrophes)
         fixed = re.sub(r"True", "true", fixed)
         fixed = re.sub(r"False", "false", fixed)
         fixed = re.sub(r"None", "null", fixed)
@@ -1210,7 +1210,8 @@ def build_entries_string(groups: dict) -> str:
     lines = []
 
     for e in groups.get("CRITICAL", []):
-        ieso     = f" [IESO NOTIFIED @ {e['ieso_notification_time']}]" if e["ieso_notified"] else ""
+        ieso_time = e["ieso_notification_time"] or "time unrecorded"
+        ieso     = f" [IESO NOTIFIED @ {ieso_time}]" if e["ieso_notified"] else ""
         elog_tag = (f" [elog_p{e['elog_priority']}]"
                     if e.get("elog_priority") else "")
         lines.append(
@@ -1224,7 +1225,8 @@ def build_entries_string(groups: dict) -> str:
         )
 
     for e in groups.get("HIGH", []):
-        ieso     = f" [IESO NOTIFIED @ {e['ieso_notification_time']}]" if e["ieso_notified"] else ""
+        ieso_time = e["ieso_notification_time"] or "time unrecorded"
+        ieso     = f" [IESO NOTIFIED @ {ieso_time}]" if e["ieso_notified"] else ""
         elog_tag = (f" [elog_p{e['elog_priority']}]"
                     if e.get("elog_priority") else "")
         lines.append(
@@ -1268,7 +1270,7 @@ def build_executive_summary_prompt(entries: str, groups: dict,
 
     ieso_events = [e for g in groups.values() for e in g if e.get("ieso_notified")]
     ieso_detail = "; ".join(
-        f"{e['equip']} @ {e.get('ieso_notification_time','unknown')}"
+        f"{e['equip']} @ {e.get('ieso_notification_time') or 'unknown'}"
         for e in ieso_events
     ) if ieso_events else "none this shift"
 
@@ -1308,6 +1310,28 @@ def load_llm_with_ctx(n_ctx: int, log: logging.Logger) -> Llama:
     return STEP2_TEMPLATE.load_llm(log, n_ctx_override=n_ctx)
 
 
+def compute_summary_ctx(prompt: str, target_output: int,
+                        log: logging.Logger) -> tuple[int, int]:
+    """
+    Compute n_ctx and max_tokens for the executive summary LLM.
+    n_ctx = next power of 2 at or above (prompt_tokens + target_output + 64),
+    capped at RAM_SAFE_MAX (16 384).
+    max_tokens = min(target_output, n_ctx - prompt_tokens - 64).
+    """
+    RAM_SAFE_MAX  = 16_384
+    prompt_tokens = approx_tokens(prompt)
+    needed        = prompt_tokens + target_output + 64
+
+    n_ctx = 1
+    while n_ctx < needed:
+        n_ctx <<= 1
+    n_ctx = min(n_ctx, RAM_SAFE_MAX)
+
+    max_tokens = max(1, min(target_output, n_ctx - prompt_tokens - 64))
+    log.info(f"compute_summary_ctx: prompt~{prompt_tokens}tok  "
+             f"needed={needed}  n_ctx={n_ctx}  max_tokens={max_tokens}")
+    return n_ctx, max_tokens
+
 
 def hierarchical_summarise(llm: Llama, groups: dict,
                             log: logging.Logger) -> str:
@@ -1340,21 +1364,25 @@ def hierarchical_summarise(llm: Llama, groups: dict,
         chunk_num = chunk_start // HIER_CHUNK_SIZE + 1
         lines     = []
         for e in chunk:
-            ieso = f" [IESO@{e['ieso_notification_time']}]" if e["ieso_notified"] else ""
+            ieso_time = e["ieso_notification_time"] or "time unrecorded"
+            ieso = f" [IESO@{ieso_time}]" if e["ieso_notified"] else ""
             lines.append(
                 f"- {e['ts']} | {e['equip']} | {e['sector']}{ieso}\n"
                 f"  {e['summary']}"
             )
-        chunk_prompt = (
-            "[INST] You are a grid operations analyst. "
+        chunk_content = (
             "Summarise these HIGH priority electricity system events in 2-3 sentences. "
             "Name each station and what happened. Plain prose, no bullets.\n\n"
             f"EVENTS:\n{chr(10).join(lines)}\n\n"
-            "Summary: [/INST]"
+            "Summary:"
+        )
+        chunk_prompt = STEP2_TEMPLATE.format_prompt(
+            chunk_content,
+            system="You are a grid operations analyst for an electricity transmission system.",
         )
         result   = llm(chunk_prompt, max_tokens=150, temperature=0.1,
                        top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
-        raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt)
+        raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
         mini_sum = raw.strip()
         high_mini_summaries.append(f"HIGH events (group {chunk_num}): {mini_sum}")
         log.info(f"  HIGH chunk {chunk_num}: {len(chunk)} records → mini-summary done")
@@ -1364,7 +1392,8 @@ def hierarchical_summarise(llm: Llama, groups: dict,
 
     # CRITICAL — always full detail
     for e in critical:
-        ieso = f" [IESO NOTIFIED @ {e['ieso_notification_time']}]" if e["ieso_notified"] else ""
+        ieso_time = e["ieso_notification_time"] or "time unrecorded"
+        ieso = f" [IESO NOTIFIED @ {ieso_time}]" if e["ieso_notified"] else ""
         compressed_lines.append(
             f"[CRITICAL]{ieso}\n"
             f"  Time: {e['ts']} | Equipment: {e['equip']} | Sector: {e['sector']}\n"
@@ -1465,7 +1494,6 @@ def generate_executive_summary(groups: dict, shift_label: str,
     print("═" * 70 + "\n")
     text = ""
     t0   = time.perf_counter()
-    last_chunk = None
     for chunk in sum_llm(
         prompt,
         max_tokens=max_tokens,
@@ -1478,14 +1506,18 @@ def generate_executive_summary(groups: dict, shift_label: str,
     ):
         tok = chunk["choices"][0]["text"]
         print(tok, end="", flush=True)
-        text    += tok
-        last_chunk = chunk
+        text += tok
     elapsed = time.perf_counter() - t0
     print("\n")
 
-    # Step 10: token tracking for summary pass
-    if last_chunk:
-        TOKEN_TRACKER.record(last_chunk, label="executive_summary")
+    # Step 10: token tracking — streaming chunks carry no usage dict; approximate
+    TOKEN_TRACKER.record({
+        "usage": {
+            "prompt_tokens":     approx_tokens(prompt),
+            "completion_tokens": approx_tokens(text),
+            "total_tokens":      approx_tokens(prompt) + approx_tokens(text),
+        }
+    }, label="executive_summary")
 
     # Strip any echoed prompt
     text = strip_prompt_echo(text, prompt, STEP2_TEMPLATE)
@@ -1544,7 +1576,7 @@ def save_report(summary: str, groups: dict, all_records: list[dict],
                             f"{e['elog_priority_label']}"
                             if e.get("elog_priority") else "elog_p?")
                 f.write(
-                    f"\n[{level}|{elog_pri}|T{e['tier']}] "
+                    f"\n[{level}|{elog_pri}|T{e.get('tier','')}] "
                     f"{e['log_id']} {e['ts']}\n"
                     f"  Equip  : {e['equip']}\n"
                     f"  Sector : {e['sector']}  Code: {e['code']}\n"
@@ -1553,7 +1585,7 @@ def save_report(summary: str, groups: dict, all_records: list[dict],
                     f.write(f"  CodeDef: {e['code_context'][:100]}\n")
                 f.write(
                     f"  Summary: {e['summary']}\n"
-                    f"  IESO   : {'Yes @ '+str(e['ieso_notification_time']) if e['ieso_notified'] else 'No'}\n"
+                    f"  IESO   : {'Yes @ '+(e['ieso_notification_time'] or 'time unrecorded') if e['ieso_notified'] else 'No'}\n"
                     f"  Raw    : {str(e['comment_raw'])[:120]}"
                     f"{'…' if len(str(e['comment_raw']))>120 else ''}\n"
                 )
