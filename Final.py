@@ -322,7 +322,7 @@ class ModelConfig:
             "n_ctx":           self.n_ctx,
             "n_batch":         self.n_batch,
             "n_threads":       self.n_threads,
-            "n_threads_batch": self.n_threads_batch,
+            "n_threads_batch": self.n_threads_batch if self.n_threads_batch > 0 else self.n_threads,
             "n_gpu_layers":    self.n_gpu_layers,
             "f16_kv":          self.f16_kv,
             "type_k":          self.type_k,
