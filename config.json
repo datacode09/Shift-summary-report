@@ -1,0 +1,37 @@
+{
+  "excel_path":       "./Sample_Elog_data.xlsx",
+  "sheet_name":       "OP_LOG_2025_ONWARD",
+  "elog_codes_path":  "./elog_codes.json",
+  "reports_dir":      "./reports",
+  "logs_dir":         "./logs",
+  "dev_dir":          "./dev",
+
+  "llm_batch_size":    10,
+  "max_comment_chars": 400,
+  "dev_mode":          true,
+  "n_threads":         4,
+  "n_batch":           512,
+  "n_ctx":             4096,
+  "n_gpu_layers":      0,
+  "f16_kv":            true,
+
+  "step1_model": {
+    "model_path":  "./qwen2.5-3b-instruct-q4_k_m.gguf",
+    "template":    "chatml",
+    "n_ctx":       4096,
+    "n_batch":     512,
+    "n_threads":   4,
+    "n_gpu_layers": 0,
+    "f16_kv":      true
+  },
+
+  "step2_model": {
+    "model_path":  "./mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+    "template":    "mistral",
+    "n_ctx":       4096,
+    "n_batch":     512,
+    "n_threads":   4,
+    "n_gpu_layers": 0,
+    "f16_kv":      true
+  }
+}
