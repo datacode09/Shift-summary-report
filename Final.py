@@ -4,6 +4,23 @@
 ║        HydroOne / IESO E-log  ·  llama-cpp  ·  CPU-only                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
+CHANGELOG
+─────────
+2026-05-29  CPU latency + model-swap hardening pass
+  • ModelConfig: added n_threads_batch (separate prefill thread count),
+    type_k / type_v (Q8_0 KV cache — halves KV RAM vs fp16),
+    flash_attn (faster attention kernel on CPU, llama-cpp ≥ 0.2.56).
+  • N_THREADS default: was hardcoded 4; now auto-detects physical core count
+    via psutil.cpu_count(logical=False) or os.cpu_count()//2 fallback.
+  • Step 1 n_ctx default: reduced 4096 → 2048 (10-record batches never
+    exceed ~1,800 tokens; over-provisioning wasted KV cache RAM every batch).
+  • PromptTemplate: added phi3 template (Phi-3/Phi-4-mini) and gemma template
+    (Gemma 2/3), each with correct strip_response() marker.
+  • Bug fix: hierarchical summarisation was loading the Step 2 model with
+    LLM_CONFIG["n_ctx"] (Step 1's context size); corrected to STEP2_MODEL.n_ctx.
+  • All new fields (type_k, type_v, flash_attn, n_threads_batch) are fully
+    config.json-overridable per model via step1_model / step2_model sections.
+
 PURPOSE
 ───────
 Reads the IESO E-log Excel file for a configured shift window, enriches every
@@ -216,8 +233,17 @@ SHIFT_DATE       = _shift_cfg.get("shift_date",       None)  # "YYYY-MM-DD" or n
 LLM_BATCH_SIZE    = _cfg.get("llm_batch_size",    10)
 MAX_COMMENT_CHARS = _cfg.get("max_comment_chars", 400)
 DEV_MODE          = _cfg.get("dev_mode",          False)
-N_THREADS         = _cfg.get("n_threads",         4)
 N_BATCH           = _cfg.get("n_batch",           512)
+
+# Auto-detect physical (non-hyperthreaded) core count for n_threads default.
+# Physical cores are optimal for LLM inference; logical (HT) cores add overhead.
+try:
+    import psutil as _psutil
+    _PHYS_CORES: int = _psutil.cpu_count(logical=False) or 4
+except ImportError:
+    _PHYS_CORES = max(1, (os.cpu_count() or 8) // 2)
+
+N_THREADS = _cfg.get("n_threads", _PHYS_CORES)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TWO-MODEL ARCHITECTURE
@@ -271,28 +297,42 @@ class ModelConfig:
     All configuration for one LLM — model file, hardware settings,
     and the chat template it was trained with.
     """
-    model_path:    str
-    template:      str    # "mistral" | "chatml" | "llama3"
-    system_prompt: str    # used by chatml/llama3; ignored by mistral
-    n_ctx:         int    = 4096
-    n_batch:       int    = 512
-    n_threads:     int    = 4
-    n_gpu_layers:  int    = 0
-    f16_kv:        bool   = True
+    model_path:      str
+    template:        str    # "mistral" | "chatml" | "llama3" | "phi3" | "gemma"
+    system_prompt:   str    # used by chatml/llama3/phi3; prepended for mistral/gemma
+    n_ctx:           int    = 4096
+    n_batch:         int    = 512
+    n_threads:       int    = 4
+    # n_threads_batch controls prompt-eval (prefill) parallelism separately from
+    # token generation. Prefill is compute-bound and scales well with more cores;
+    # generation is memory-bandwidth-bound and gains little past physical cores.
+    # -1 = inherit n_threads; set to physical core count for fastest prefill.
+    n_threads_batch: int    = -1
+    n_gpu_layers:    int    = 0
+    f16_kv:          bool   = True   # kept for older llama-cpp compat; type_k/v override
+    # Q8_0 KV cache halves KV memory vs f16 with negligible quality loss.
+    # 0=F32  1=F16  8=Q8_0  2=Q4_0  (Q8_0 is the low-RAM sweet spot)
+    type_k:          int    = 8
+    type_v:          int    = 8
+    flash_attn:      bool   = True   # faster attention kernel; CPU-supported in recent builds
 
     def to_llama_kwargs(self) -> dict:
         """Return kwargs for Llama() constructor."""
         return {
-            "n_ctx":        self.n_ctx,
-            "n_batch":      self.n_batch,
-            "n_threads":    self.n_threads,
-            "n_gpu_layers": self.n_gpu_layers,
-            "f16_kv":       self.f16_kv,
-            "logits_all":   False,
-            "embedding":    False,
-            "verbose":      False,
-            "use_mmap":     True,
-            "use_mlock":    False,
+            "n_ctx":           self.n_ctx,
+            "n_batch":         self.n_batch,
+            "n_threads":       self.n_threads,
+            "n_threads_batch": self.n_threads_batch,
+            "n_gpu_layers":    self.n_gpu_layers,
+            "f16_kv":          self.f16_kv,
+            "type_k":          self.type_k,
+            "type_v":          self.type_v,
+            "flash_attn":      self.flash_attn,
+            "logits_all":      False,
+            "embedding":       False,
+            "verbose":         False,
+            "use_mmap":        True,
+            "use_mlock":       False,
         }
 
     def to_llama_kwargs_with_ctx(self, n_ctx: int) -> dict:
@@ -308,31 +348,42 @@ def _build_model_config(cfg_section: dict, defaults: dict) -> ModelConfig:
     defaults is either _step1_defaults or _step2_defaults — never shared Mistral.
     """
     return ModelConfig(
-        model_path    = cfg_section.get("model_path",    defaults["model_path"]),
-        template      = cfg_section.get("template",      defaults["template"]),
-        system_prompt = cfg_section.get("system_prompt", defaults.get("system_prompt", "")),
-        n_ctx         = cfg_section.get("n_ctx",         defaults["n_ctx"]),
-        n_batch       = cfg_section.get("n_batch",       defaults["n_batch"]),
-        n_threads     = cfg_section.get("n_threads",     defaults["n_threads"]),
-        n_gpu_layers  = cfg_section.get("n_gpu_layers",  defaults["n_gpu_layers"]),
-        f16_kv        = cfg_section.get("f16_kv",        defaults["f16_kv"]),
+        model_path       = cfg_section.get("model_path",       defaults["model_path"]),
+        template         = cfg_section.get("template",         defaults["template"]),
+        system_prompt    = cfg_section.get("system_prompt",    defaults.get("system_prompt", "")),
+        n_ctx            = cfg_section.get("n_ctx",            defaults["n_ctx"]),
+        n_batch          = cfg_section.get("n_batch",          defaults["n_batch"]),
+        n_threads        = cfg_section.get("n_threads",        defaults["n_threads"]),
+        n_threads_batch  = cfg_section.get("n_threads_batch",  defaults.get("n_threads_batch", -1)),
+        n_gpu_layers     = cfg_section.get("n_gpu_layers",     defaults["n_gpu_layers"]),
+        f16_kv           = cfg_section.get("f16_kv",           defaults.get("f16_kv",     True)),
+        type_k           = cfg_section.get("type_k",           defaults.get("type_k",     8)),
+        type_v           = cfg_section.get("type_v",           defaults.get("type_v",     8)),
+        flash_attn       = cfg_section.get("flash_attn",       defaults.get("flash_attn", True)),
     )
 
 
 # ── Shared hardware defaults (apply to both models unless overridden) ─────────
 _shared_defaults = {
-    "n_ctx":        _cfg.get("n_ctx",        4096),
-    "n_batch":      N_BATCH,
-    "n_threads":    N_THREADS,
-    "n_gpu_layers": _cfg.get("n_gpu_layers", 0),
-    "f16_kv":       _cfg.get("f16_kv",       True),
+    "n_ctx":            _cfg.get("n_ctx",            4096),
+    "n_batch":          N_BATCH,
+    "n_threads":        N_THREADS,
+    "n_threads_batch":  _cfg.get("n_threads_batch",  -1),
+    "n_gpu_layers":     _cfg.get("n_gpu_layers",     0),
+    "f16_kv":           _cfg.get("f16_kv",           True),
+    "type_k":           _cfg.get("type_k",           8),
+    "type_v":           _cfg.get("type_v",           8),
+    "flash_attn":       _cfg.get("flash_attn",       True),
 }
 
 # ── Step 1: analyze_entry — Qwen2.5-3B (fast, JSON-strong, ~2GB) ─────────────
 # Default: Qwen2.5-3B Q4_K_M with ChatML template
 # Override via config.json "step1_model" section
+# n_ctx=2048: 10 records + system prompt ≈ 1,500–1,800 tokens max.
+# Over-provisioning wastes KV cache RAM and slows prefill on every batch.
 _step1_defaults = {
     **_shared_defaults,
+    "n_ctx":         2048,
     "model_path":    "./qwen2.5-3b-instruct-q4_k_m.gguf",
     "template":      "chatml",
     "system_prompt": "",
@@ -370,12 +421,16 @@ class PromptTemplate:
     Wraps a ModelConfig and provides format_prompt() to wrap content in the
     correct chat template for that model family.
 
-    Mistral:  [INST] {content} [/INST]
-    ChatML:   <|im_start|>system\\n{sys}<|im_end|>\\n
+    mistral : [INST] {content} [/INST]
+    chatml  : <|im_start|>system\\n{sys}<|im_end|>\\n
               <|im_start|>user\\n{user}<|im_end|>\\n
               <|im_start|>assistant\\n
-    Llama3:   <|begin_of_text|><|start_header_id|>user<|end_header_id|>
+    llama3  : <|begin_of_text|><|start_header_id|>user<|end_header_id|>
               \\n\\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\\n\\n
+    phi3    : <|system|>\\n{sys}<|end|>\\n<|user|>\\n{content}<|end|>\\n<|assistant|>\\n
+              (Phi-3 / Phi-4-mini — distinct from ChatML despite visual similarity)
+    gemma   : <start_of_turn>user\\n{content}<end_of_turn>\\n<start_of_turn>model\\n
+              (Gemma 2/3 — no dedicated system role)
     """
 
     def __init__(self, model_cfg: ModelConfig):
@@ -418,9 +473,23 @@ class PromptTemplate:
             )
             return "".join(parts)
 
+        elif self.template == "phi3":
+            # Phi-3 / Phi-4-mini — uses <|system|>/<|user|>/<|assistant|>/<|end|>
+            parts = []
+            if sys_text:
+                parts.append(f"<|system|>\n{sys_text}<|end|>")
+            parts.append(f"<|user|>\n{content}<|end|>")
+            parts.append("<|assistant|>")
+            return "\n".join(parts)
+
+        elif self.template == "gemma":
+            # Gemma 2/3 — no dedicated system role; system text prepended to user turn
+            full = f"{sys_text}\n\n{content}".strip() if sys_text else content
+            return f"<start_of_turn>user\n{full}<end_of_turn>\n<start_of_turn>model\n"
+
         else:
             raise ValueError(f"Unknown template: '{self.template}'. "
-                             f"Use 'mistral', 'chatml', or 'llama3'.")
+                             f"Use 'mistral', 'chatml', 'llama3', 'phi3', or 'gemma'.")
 
     def strip_response(self, raw: str) -> str:
         """
@@ -431,6 +500,8 @@ class PromptTemplate:
             "mistral": "[/INST]",
             "chatml":  "<|im_start|>assistant",
             "llama3":  "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "phi3":    "<|assistant|>",
+            "gemma":   "<start_of_turn>model\n",
         }
         marker = markers.get(self.template, "[/INST]")
         idx = raw.rfind(marker)
@@ -1465,7 +1536,7 @@ def generate_executive_summary(groups: dict, shift_label: str,
                     f"Using hierarchical summarisation.")
 
         # Load with standard ctx for mini-summary pass
-        hier_llm = load_llm_with_ctx(LLM_CONFIG["n_ctx"], log)
+        hier_llm = load_llm_with_ctx(STEP2_MODEL.n_ctx, log)
         entries  = hierarchical_summarise(hier_llm, groups, log)
         del hier_llm; gc.collect()
 
