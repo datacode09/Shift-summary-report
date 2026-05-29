@@ -18,7 +18,7 @@
   "step1_model": {
     "model_path":  "./qwen2.5-0.5b-instruct-q4_k_m.gguf",
     "template":    "chatml",
-    "n_ctx":       1024,
+    "n_ctx":       2048,
     "n_batch":     512,
     "n_threads":   4,
     "n_gpu_layers": 0,
