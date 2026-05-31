@@ -913,6 +913,7 @@ def prepare_rows(df: pd.DataFrame, log: logging.Logger) -> list[dict]:
 # succeeds even if the model echoes the input's "ENTRY" label instead of
 # writing the expected "RECORD" label.
 _LABELED_RECORD_RE = re.compile(r"\b(?:RECORD|ENTRY)\s+(\d+)\b", re.IGNORECASE)
+_TIME_HHMI_RE      = re.compile(r"^\d{1,2}:\d{2}$")   # HH:MM validation — pre-compiled
 _LABELED_FIELDS    = {
     "include":  re.compile(r"\bINCLUDE\s*[:=]\s*(yes|no|true|false)\b",             re.IGNORECASE),
     "priority": re.compile(r"\bPRIORITY\s*[:=]\s*(CRITICAL|HIGH|MEDIUM|LOW)\b",     re.IGNORECASE),
@@ -1042,10 +1043,14 @@ def parse_labeled_response(raw: str, expected: int,
             log.debug(f"Batch {batch_num}: RECORD {rec_id} invalid priority — skipping")
             continue
 
+        if not ieso_m:
+            log.warning(f"Batch {batch_num}: RECORD {rec_id} missing IESO field — "
+                        f"defaulting ieso_notified=False; verify summary manually")
+
         ieso_time = None
         if time_m:
             raw_t = time_m.group(1).upper().replace("/", "")
-            if re.match(r"^\d{1,2}:\d{2}$", raw_t):
+            if _TIME_HHMI_RE.match(raw_t):
                 ieso_time = raw_t
 
         results[rec_id] = {
@@ -1059,6 +1064,11 @@ def parse_labeled_response(raw: str, expected: int,
 
     if not results:
         return None
+
+    spurious = [k for k in results if k < 1 or k > expected]
+    if spurious:
+        log.warning(f"Batch {batch_num}: model produced out-of-range RECORD IDs {spurious} "
+                    f"(expected 1–{expected}) — discarded")
 
     found = [results[i] for i in range(1, expected + 1) if i in results]
     if not found:
@@ -1078,8 +1088,10 @@ def strip_prompt_echo(raw: str, prompt: str,
     Falls back to searching for the marker string directly.
     """
     if template:
-        return template.strip_response(raw)
-    # Legacy fallback — try common markers in order
+        stripped = template.strip_response(raw)
+        if len(stripped) < len(raw):   # template found a boundary — trust it
+            return stripped
+        # Template returned unchanged output; fall through to marker search
     for marker in ("[/INST]", "<|im_start|>assistant", "<|start_header_id|>assistant"):
         idx = raw.rfind(marker)
         if idx != -1:
@@ -1147,8 +1159,15 @@ def run_analyze_entry(llm: Llama,
         # Labeled format is compact: ~100 tokens/record + summary headroom
         max_tokens = n * 150
 
-        if pt + max_tokens > LLM_CONFIG["n_ctx"] * 0.90:
-            log.warning(f"Batch {batch_num}: prompt~{pt}tok near context limit")
+        budget = int(LLM_CONFIG["n_ctx"] * 0.90) - pt
+        if budget < n * 50:
+            log.error(f"Batch {batch_num}: prompt too large ({pt}tok), "
+                      f"only {budget}tok budget remaining (need ~{n*50}tok minimum)")
+            max_tokens = max(50, budget)
+        elif budget < max_tokens:
+            log.warning(f"Batch {batch_num}: prompt~{pt}tok near context limit — "
+                        f"capping max_tokens {max_tokens}→{budget}")
+            max_tokens = budget
 
         result = llm(
             prompt,
@@ -1174,10 +1193,18 @@ def run_analyze_entry(llm: Llama,
             log.warning(f"Batch {batch_num}: labeled parse failed — "
                         f"retrying {n} records individually")
             for i, rec in enumerate(batch, 1):
-                solo_prompt  = build_analyze_entry_prompt_labeled([rec])
-                solo_result  = llm(solo_prompt, max_tokens=200,
+                solo_prompt      = build_analyze_entry_prompt_labeled([rec])
+                solo_pt          = approx_tokens(solo_prompt)
+                solo_max_tokens  = 200
+                solo_budget      = int(LLM_CONFIG["n_ctx"] * 0.90) - solo_pt
+                if solo_budget < solo_max_tokens:
+                    solo_max_tokens = max(50, solo_budget)
+                    log.warning(f"  Solo retry record {i}: prompt~{solo_pt}tok — "
+                                f"capping max_tokens 200→{solo_max_tokens}")
+                solo_result  = llm(solo_prompt, max_tokens=solo_max_tokens,
                                    temperature=0.0, top_k=1,
                                    top_p=1.0, repeat_penalty=1.0, echo=False)
+                TOKEN_TRACKER.record(solo_result, label=f"solo_{batch_num}_{i}")
                 solo_raw     = strip_prompt_echo(
                     solo_result["choices"][0]["text"], solo_prompt, STEP1_TEMPLATE)
                 solo_parsed  = parse_labeled_response(solo_raw, 1, log, batch_num)
@@ -1417,6 +1444,7 @@ def hierarchical_summarise(llm: Llama, groups: dict,
         )
         result   = llm(chunk_prompt, max_tokens=150, temperature=0.1,
                        top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
+        TOKEN_TRACKER.record(result, label=f"hier_chunk_{chunk_num}")
         raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
         mini_sum = raw.strip()
         high_mini_summaries.append(f"HIGH events (group {chunk_num}): {mini_sum}")
