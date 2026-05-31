@@ -448,9 +448,18 @@ class PromptTemplate:
                  f"n_threads={self.cfg.n_threads}  n_batch={self.cfg.n_batch}  "
                  f"f16_kv={self.cfg.f16_kv}")
         if not os.path.exists(self.cfg.model_path):
-            log.critical(f"Model file not found: {self.cfg.model_path}")
-            sys.exit(1)
-        llm = Llama(model_path=self.cfg.model_path, **kwargs)
+            raise FileNotFoundError(f"Model file not found: {self.cfg.model_path}")
+        try:
+            llm = Llama(model_path=self.cfg.model_path, **kwargs)
+        except MemoryError as exc:
+            raise RuntimeError(
+                f"Out of RAM loading {self.cfg.model_path} "
+                f"(n_ctx={n_ctx}) — reduce n_ctx or free RAM"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load {self.cfg.model_path}: {type(exc).__name__}: {exc}"
+            ) from exc
         log.info(f"Model loaded ✓  ({self.template})")
         return llm
 
@@ -1169,23 +1178,26 @@ def run_analyze_entry(llm: Llama,
                         f"capping max_tokens {max_tokens}→{budget}")
             max_tokens = budget
 
-        result = llm(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            top_k=1,
-            top_p=1.0,
-            repeat_penalty=1.0,
-            echo=False,
-        )
-        raw     = result["choices"][0]["text"]
-        clean   = strip_prompt_echo(raw, prompt, STEP1_TEMPLATE)
-
-        # Step 10: token usage tracking
-        TOKEN_TRACKER.record(result, label=f"batch_{batch_num}")
-
-        parsed = parse_labeled_response(clean, n, log, batch_num)
-        dev.llm_batch(batch_num, prompt, clean, parsed)
+        try:
+            result = llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                repeat_penalty=1.0,
+                echo=False,
+            )
+            raw    = result["choices"][0]["text"]
+            clean  = strip_prompt_echo(raw, prompt, STEP1_TEMPLATE)
+            TOKEN_TRACKER.record(result, label=f"batch_{batch_num}")
+            parsed = parse_labeled_response(clean, n, log, batch_num)
+            dev.llm_batch(batch_num, prompt, clean, parsed)
+        except Exception as exc:
+            log.error(f"Batch {batch_num}: LLM inference error "
+                      f"({type(exc).__name__}: {exc}) — retrying {n} records individually")
+            dev.llm_batch(batch_num, prompt, None, None)
+            parsed = None
 
         if parsed is None:
             # Labeled parse found no RECORD blocks — retry each record individually
@@ -1201,13 +1213,18 @@ def run_analyze_entry(llm: Llama,
                     solo_max_tokens = max(50, solo_budget)
                     log.warning(f"  Solo retry record {i}: prompt~{solo_pt}tok — "
                                 f"capping max_tokens 200→{solo_max_tokens}")
-                solo_result  = llm(solo_prompt, max_tokens=solo_max_tokens,
-                                   temperature=0.0, top_k=1,
-                                   top_p=1.0, repeat_penalty=1.0, echo=False)
-                TOKEN_TRACKER.record(solo_result, label=f"solo_{batch_num}_{i}")
-                solo_raw     = strip_prompt_echo(
-                    solo_result["choices"][0]["text"], solo_prompt, STEP1_TEMPLATE)
-                solo_parsed  = parse_labeled_response(solo_raw, 1, log, batch_num)
+                try:
+                    solo_result = llm(solo_prompt, max_tokens=solo_max_tokens,
+                                      temperature=0.0, top_k=1,
+                                      top_p=1.0, repeat_penalty=1.0, echo=False)
+                    TOKEN_TRACKER.record(solo_result, label=f"solo_{batch_num}_{i}")
+                    solo_raw    = strip_prompt_echo(
+                        solo_result["choices"][0]["text"], solo_prompt, STEP1_TEMPLATE)
+                    solo_parsed = parse_labeled_response(solo_raw, 1, log, batch_num)
+                except Exception as exc:
+                    log.error(f"  Solo retry record {i} ({rec['log_id']}): "
+                              f"LLM error ({type(exc).__name__}: {exc})")
+                    solo_parsed = None
                 if solo_parsed and len(solo_parsed) >= 1:
                     res = solo_parsed[0]
                     rec.update({
@@ -1442,13 +1459,18 @@ def hierarchical_summarise(llm: Llama, groups: dict,
             chunk_content,
             system="You are a grid operations analyst for an electricity transmission system.",
         )
-        result   = llm(chunk_prompt, max_tokens=150, temperature=0.1,
-                       top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
-        TOKEN_TRACKER.record(result, label=f"hier_chunk_{chunk_num}")
-        raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
-        mini_sum = raw.strip()
+        try:
+            result   = llm(chunk_prompt, max_tokens=150, temperature=0.1,
+                           top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
+            TOKEN_TRACKER.record(result, label=f"hier_chunk_{chunk_num}")
+            raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
+            mini_sum = raw.strip()
+            log.info(f"  HIGH chunk {chunk_num}: {len(chunk)} records → mini-summary done")
+        except Exception as exc:
+            log.error(f"  HIGH chunk {chunk_num}: LLM failed "
+                      f"({type(exc).__name__}: {exc}) — using raw entries as fallback")
+            mini_sum = "; ".join(f"{e['equip']}: {e['summary'][:80]}" for e in chunk)
         high_mini_summaries.append(f"HIGH events (group {chunk_num}): {mini_sum}")
-        log.info(f"  HIGH chunk {chunk_num}: {len(chunk)} records → mini-summary done")
 
     # ── Pass B: build compressed entries string for executive summary ─────────
     compressed_lines = []
@@ -1528,9 +1550,15 @@ def generate_executive_summary(groups: dict, shift_label: str,
                     f"Using hierarchical summarisation.")
 
         # Load with standard ctx for mini-summary pass
-        hier_llm = load_llm_with_ctx(STEP2_MODEL.n_ctx, log)
-        entries  = hierarchical_summarise(hier_llm, groups, log)
-        del hier_llm; gc.collect()
+        try:
+            hier_llm = load_llm_with_ctx(STEP2_MODEL.n_ctx, log)
+        except (FileNotFoundError, RuntimeError) as exc:
+            log.critical(f"Step 2 model load failed during hierarchical pass: {exc}")
+            return "[Executive summary unavailable — Step 2 model failed to load]"
+        try:
+            entries = hierarchical_summarise(hier_llm, groups, log)
+        finally:
+            del hier_llm; gc.collect()
 
         # Rebuild prompt with compressed entries
         prompt        = build_executive_summary_prompt(entries, groups, shift_label)
@@ -1548,7 +1576,11 @@ def generate_executive_summary(groups: dict, shift_label: str,
                     f"Summary will be very brief.")
 
     # ── Load LLM with dynamic n_ctx ───────────────────────────────────────────
-    sum_llm = load_llm_with_ctx(n_ctx, log)
+    try:
+        sum_llm = load_llm_with_ctx(n_ctx, log)
+    except (FileNotFoundError, RuntimeError) as exc:
+        log.critical(f"Step 2 model load failed: {exc}")
+        return "[Executive summary unavailable — Step 2 model failed to load]"
 
     # ── Generate ──────────────────────────────────────────────────────────────
     print("\n" + "═" * 70)
@@ -1557,19 +1589,27 @@ def generate_executive_summary(groups: dict, shift_label: str,
     print("═" * 70 + "\n")
     text = ""
     t0   = time.perf_counter()
-    for chunk in sum_llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=0.2,
-        top_k=40,
-        top_p=0.9,
-        repeat_penalty=1.15,
-        stream=True,
-        echo=False,
-    ):
-        tok = chunk["choices"][0]["text"]
-        print(tok, end="", flush=True)
-        text += tok
+    try:
+        for chunk in sum_llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            top_k=40,
+            top_p=0.9,
+            repeat_penalty=1.15,
+            stream=True,
+            echo=False,
+        ):
+            tok = chunk["choices"][0]["text"]
+            print(tok, end="", flush=True)
+            text += tok
+    except Exception as exc:
+        log.error(f"Executive summary generation failed mid-stream "
+                  f"({type(exc).__name__}: {exc})")
+        if not text.strip():
+            text = "[Executive summary generation failed — see audit CSV for details]"
+    finally:
+        del sum_llm; gc.collect()
     elapsed = time.perf_counter() - t0
     print("\n")
 
@@ -1586,8 +1626,6 @@ def generate_executive_summary(groups: dict, shift_label: str,
     text = strip_prompt_echo(text, prompt, STEP2_TEMPLATE)
     log.info(f"Executive summary: {len(text)} chars  {elapsed:.1f}s  "
              f"n_ctx_used={n_ctx}")
-
-    del sum_llm; gc.collect()
 
     dev.summary_artifacts(prompt, text)
     return text
@@ -1705,12 +1743,12 @@ def main():
     # ── STEP 1: analyze_entry.prompty — every record ──────────────────────────
     # No pre-filtering. Every record is enriched with elog_codes.json and
     # sent to the LLM. The LLM decides should_include, priority, summary.
-    if not os.path.exists(STEP1_MODEL.model_path):
-        log.critical(f"Step 1 model not found: {STEP1_MODEL.model_path}")
-        sys.exit(1)
-
     log.info(f"Loading Step 1 model ({STEP1_MODEL.template} template) …")
-    llm = STEP1_TEMPLATE.load_llm(log)
+    try:
+        llm = STEP1_TEMPLATE.load_llm(log)
+    except (FileNotFoundError, RuntimeError) as exc:
+        log.critical(f"Step 1 model load failed: {exc}")
+        sys.exit(1)
     timer.split("Load Step 1 model")
 
     analyzed = run_analyze_entry(llm, records, log, dev)
