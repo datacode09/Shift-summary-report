@@ -897,7 +897,8 @@ def prepare_rows(df: pd.DataFrame, log: logging.Logger) -> list[dict]:
         out.append({
             "log_id":              str(row.get(idc,""))         if idc else "",
             "ts":                  build_ts(row, sc, ec),
-            "equip":               str(row.get(eqc,""))[:60]    if eqc else "",
+            "equip":               ("" if not eqc or pd.isna(row.get(eqc))
+                                   else str(row.get(eqc)).strip())[:60],
             "code":                code,
             "sector":              str(row.get(sec,""))[:30]    if sec else "",
             "completed":           str(row.get(cpc,"")).strip().upper() if cpc else "",
@@ -1431,10 +1432,17 @@ def run_analyze_entry(llm: Llama,
                 safe_default_record(i, rec, "ID gap")
                 log.warning(f"Step1 ID GAP | {rec['log_id']} | id {i} missing")
 
-        inc     = sum(1 for r in batch if r["should_include"])
+        inc    = sum(1 for r in batch if r["should_include"])
+        n_crit = sum(1 for r in batch if r.get("priority") == "CRITICAL")
+        n_high = sum(1 for r in batch if r.get("priority") == "HIGH")
+        n_med  = sum(1 for r in batch if r.get("priority") == "MEDIUM")
+        n_low  = sum(1 for r in batch if r.get("priority") == "LOW")
         elapsed = time.perf_counter() - t0
+        equip_hint = batch[0]["equip"][:25] if batch[0]["equip"] else ""
         log.info(f"Batch {batch_num:4d} [{start+n:5d}/{total:5d}]  "
-                 f"✓ {inc}/{n} included  {elapsed:.1f}s  {batch[0]['equip'][:25]}")
+                 f"✓ {inc}/{n} incl  C:{n_crit} H:{n_high} M:{n_med} L:{n_low}  "
+                 f"{elapsed:.1f}s"
+                 + (f"  — {equip_hint}" if equip_hint else ""))
         all_done.extend(batch)
 
     # ── CRITICAL re-verification ──────────────────────────────────────────────
