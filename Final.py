@@ -1371,6 +1371,50 @@ def run_analyze_entry(llm: Llama,
 
         # Apply parsed results
         id_map = {obj["id"]: obj for obj in parsed}
+
+        # ── Retry records the model skipped without being token-limited ──────────
+        # finish_reason=stop with fewer blocks than expected means the model
+        # completed naturally but omitted some entries.  Those need individual
+        # retry — not an immediate safe_default.
+        missing_ids = [i for i in range(1, n + 1) if i not in id_map]
+        if missing_ids:
+            log.warning(f"Batch {batch_num}: model stopped naturally but "
+                        f"skipped records {missing_ids} — retrying individually")
+            for mid in missing_ids:
+                mrec = batch[mid - 1]
+                m_prompt  = build_analyze_entry_prompt_labeled([mrec])
+                m_pt      = approx_tokens(m_prompt)
+                m_maxtok  = 350
+                m_budget  = int(STEP1_MODEL.n_ctx * 0.90) - m_pt
+                if m_budget < m_maxtok:
+                    m_maxtok = max(50, m_budget)
+                try:
+                    m_result = llm(m_prompt, max_tokens=m_maxtok,
+                                   temperature=0.0, top_k=1,
+                                   top_p=1.0, repeat_penalty=1.0,
+                                   stop=STEP1_TEMPLATE.stop_sequences(),
+                                   echo=False)
+                    TOKEN_TRACKER.record(m_result, label=f"idgap_{batch_num}_{mid}")
+                    if not check_finish_reason(m_result, f"idgap_{batch_num}_{mid}", log):
+                        log.error(f"  ID gap retry {mrec['log_id']}: truncated — safe default")
+                        m_parsed = None
+                    else:
+                        m_raw    = strip_prompt_echo(
+                            m_result["choices"][0]["text"], m_prompt, STEP1_TEMPLATE)
+                        m_parsed = parse_labeled_response(m_raw, 1, log, batch_num)
+                except Exception as exc:
+                    log.error(f"  ID gap retry {mrec['log_id']}: LLM error ({exc}) — safe default")
+                    m_parsed = None
+
+                if m_parsed and len(m_parsed) >= 1:
+                    id_map[mid] = m_parsed[0]
+                    log.info(f"  ID gap retry ✓ | {mrec['log_id']} | "
+                             f"{m_parsed[0]['priority']}")
+                else:
+                    safe_default_record(mid, mrec, "ID gap retry failed")
+                    log.error(f"  ID gap retry ✗ | {mrec['log_id']} | safe default")
+        # ── END ID gap retry ─────────────────────────────────────────────────────
+
         for i, rec in enumerate(batch, 1):
             res = id_map.get(i)
             if res:
