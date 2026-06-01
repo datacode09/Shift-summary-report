@@ -199,7 +199,6 @@ _cfg       = _load_json_file("config.json",       "config.json")
 _shift_cfg = _load_json_file("shift_config.json", "shift_config.json")
 
 # ── Paths (from config.json) ──────────────────────────────────────────────────
-MODEL_PATH   = _cfg.get("model_path",   "./mistral-7b-instruct-v0.2.Q4_K_M.gguf")
 EXCEL_PATH   = _cfg.get("excel_path",   "./Sample_Elog_data.xlsx")
 SHEET_NAME   = _cfg.get("sheet_name",   "Sample Elog data")
 ELOG_CODES_PATH = _cfg.get("elog_codes_path", "./elog_codes.json")
@@ -354,8 +353,6 @@ STEP2_MODEL: ModelConfig = _build_model_config(
     _cfg.get("step2_model", {}), _step2_defaults
 )
 
-# Legacy LLM_CONFIG for any code that still references it directly
-LLM_CONFIG = STEP1_MODEL.to_llama_kwargs()
 
 VALID_PRIORITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
 
@@ -1168,7 +1165,7 @@ def run_analyze_entry(llm: Llama,
         # Labeled format is compact: ~100 tokens/record + summary headroom
         max_tokens = n * 150
 
-        budget = int(LLM_CONFIG["n_ctx"] * 0.90) - pt
+        budget = int(STEP1_MODEL.n_ctx * 0.90) - pt
         if budget < n * 50:
             log.error(f"Batch {batch_num}: prompt too large ({pt}tok), "
                       f"only {budget}tok budget remaining (need ~{n*50}tok minimum)")
@@ -1208,7 +1205,7 @@ def run_analyze_entry(llm: Llama,
                 solo_prompt      = build_analyze_entry_prompt_labeled([rec])
                 solo_pt          = approx_tokens(solo_prompt)
                 solo_max_tokens  = 200
-                solo_budget      = int(LLM_CONFIG["n_ctx"] * 0.90) - solo_pt
+                solo_budget      = int(STEP1_MODEL.n_ctx * 0.90) - solo_pt
                 if solo_budget < solo_max_tokens:
                     solo_max_tokens = max(50, solo_budget)
                     log.warning(f"  Solo retry record {i}: prompt~{solo_pt}tok — "
@@ -1708,11 +1705,14 @@ def main():
     log.info("ELOG CONDITIONS REPORT v7 — START")
     log.info(f"Run ID    : {run_ts}")
     log.info(f"Excel     : {EXCEL_PATH}")
-    log.info(f"Model     : {MODEL_PATH}")
+    log.info(f"Step1 mdl : {STEP1_MODEL.model_path}  template={STEP1_MODEL.template}  "
+             f"n_ctx={STEP1_MODEL.n_ctx}")
+    log.info(f"Step2 mdl : {STEP2_MODEL.model_path}  template={STEP2_MODEL.template}  "
+             f"n_ctx={STEP2_MODEL.n_ctx}")
     log.info(f"Shift     : {SHIFT_START_HOUR:02d}:00–{SHIFT_END_HOUR:02d}:00  "
              f"date={SHIFT_DATE or 'auto'}")
     log.info(f"n_threads : {N_THREADS}  n_batch={N_BATCH}  "
-             f"n_ctx={LLM_CONFIG['n_ctx']}  f16_kv={LLM_CONFIG['f16_kv']}")
+             f"f16_kv={STEP1_MODEL.f16_kv}")
     log.info(f"Dev mode  : {'ON → ' + str(Path(DEV_DIR)/run_ts) if DEV_MODE else 'OFF'}")
     log.info("=" * 60)
 
