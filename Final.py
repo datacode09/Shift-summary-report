@@ -26,7 +26,7 @@ PIPELINE  (matches application design document steps 1–10)
                                  │ all records, fully enriched
                                  ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  6. STEP 1 — analyze_entry.prompty  (Qwen2.5-3B, batched)   │
+  │  6. STEP 1 — analyze_entry.prompty  (Mistral 7B, batched)   │
   │                                                              │
   │  Every record sent to the LLM — no pre-filtering.           │
   │  LLM reads: equipment, code, code_context, elog_priority,   │
@@ -87,19 +87,20 @@ PIPELINE  (matches application design document steps 1–10)
   │    05_summary_prompt/response.txt     Step 2 artifacts       │
   └──────────────────────────────────────────────────────────────┘
 
-TWO-MODEL ARCHITECTURE
-───────────────────────
-Step 1 — analyze_entry  →  Qwen2.5-3B-Instruct Q4_K_M  (~1.9 GB)
-  • ChatML template: <|im_start|>system / user / assistant
-  • Optimised for structured JSON output
+SINGLE-MODEL ARCHITECTURE (both steps use Mistral 7B)
+───────────────────────────────────────────────────────
+Step 1 — analyze_entry  →  Mistral 7B Instruct Q4_K_M  (~4.1 GB)
+  • Mistral template: [INST]...[/INST]
+  • Better classification accuracy than 3B; same model as Step 2
   • temperature=0.0, top_k=1 (deterministic)
-  • Called once per batch (~10 records), many times per shift
+  • Called once per batch, many times per shift
 
 Step 2 — executive_summary  →  Mistral 7B Instruct Q4_K_M  (~4.1 GB)
   • Mistral template: [INST]...[/INST]
   • Optimised for coherent prose
   • temperature=0.2, top_k=40
   • Called once per shift
+  • When same model file as Step 1: model is reused without reloading
 
 Supported templates: "mistral" | "chatml" | "llama3"
 Models swapped via config.json — no code changes needed.
@@ -149,11 +150,7 @@ DEPENDENCIES
 ────────────
   pip install llama-cpp-python pandas openpyxl
 
-  Step 1 model: Qwen2.5-3B-Instruct Q4_K_M (~1.9 GB)
-    https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF
-    File: qwen2.5-3b-instruct-q4_k_m.gguf
-
-  Step 2 model: Mistral 7B Instruct v0.2 Q4_K_M (~4.1 GB)
+  Both steps: Mistral 7B Instruct v0.2 Q4_K_M (~4.1 GB)
     https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF
     File: mistral-7b-instruct-v0.2.Q4_K_M.gguf
 """
@@ -328,13 +325,13 @@ _shared_defaults = {
     "f16_kv":       _cfg.get("f16_kv",       True),
 }
 
-# ── Step 1: analyze_entry — Qwen2.5-3B (fast, JSON-strong, ~2GB) ─────────────
-# Default: Qwen2.5-3B Q4_K_M with ChatML template
+# ── Step 1: analyze_entry — Mistral 7B (same model as Step 2) ────────────────
+# Default: Mistral 7B Instruct Q4_K_M with Mistral template
 # Override via config.json "step1_model" section
 _step1_defaults = {
     **_shared_defaults,
-    "model_path":    "./qwen2.5-3b-instruct-q4_k_m.gguf",
-    "template":      "chatml",
+    "model_path":    "./mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+    "template":      "mistral",
     "system_prompt": "",
 }
 STEP1_MODEL: ModelConfig = _build_model_config(
@@ -1782,16 +1779,22 @@ def hierarchical_summarise(llm: Llama, groups: dict,
 
 def generate_executive_summary(groups: dict, shift_label: str,
                                log: logging.Logger,
-                               dev: DevArtifacts) -> str:
+                               dev: DevArtifacts,
+                               reuse_llm: Optional[Llama] = None) -> str:
     """
     Step 2 — executive_summary.prompty with dynamic n_ctx.
+
+    reuse_llm — pass the Step 1 Llama instance when both steps use the same
+    model file.  The function checks whether its loaded n_ctx is sufficient;
+    if so it skips the reload entirely (~30s saved on CPU).  The caller owns
+    the instance and is responsible for deleting it after this call returns.
 
     Workflow:
       1. Build entries string
       2. Build full prompt
       3. Measure prompt tokens
       4. Compute required n_ctx dynamically
-      5. Load LLM with that exact n_ctx
+      5. Load LLM (or reuse Step 1 instance if n_ctx fits)
       6. If entries still too large → hierarchical summarisation first
       7. Generate and return summary
     """
@@ -1824,16 +1827,24 @@ def generate_executive_summary(groups: dict, shift_label: str,
         log.warning(f"Prompt needs {needed_ctx} tokens — exceeds RAM_SAFE_MAX={RAM_SAFE_MAX}. "
                     f"Using hierarchical summarisation.")
 
-        # Load with standard ctx for mini-summary pass
-        try:
-            hier_llm = load_llm_with_ctx(STEP2_MODEL.n_ctx, log)
-        except (FileNotFoundError, RuntimeError) as exc:
-            log.critical(f"Step 2 model load failed during hierarchical pass: {exc}")
-            return "[Executive summary unavailable — Step 2 model failed to load]"
+        # Reuse Step 1 model if available — mini-summary chunks are short and
+        # fit comfortably within the Step 1 n_ctx.
+        if reuse_llm is not None:
+            log.info("Hierarchical pass: reusing Step 1 model (no reload)")
+            hier_llm    = reuse_llm
+            _hier_owned = False
+        else:
+            try:
+                hier_llm = load_llm_with_ctx(STEP2_MODEL.n_ctx, log)
+            except (FileNotFoundError, RuntimeError) as exc:
+                log.critical(f"Step 2 model load failed during hierarchical pass: {exc}")
+                return "[Executive summary unavailable — Step 2 model failed to load]"
+            _hier_owned = True
         try:
             entries = hierarchical_summarise(hier_llm, groups, log)
         finally:
-            del hier_llm; gc.collect()
+            if _hier_owned:
+                del hier_llm; gc.collect()
 
         # Rebuild prompt with compressed entries
         prompt        = build_executive_summary_prompt(entries, groups, shift_label)
@@ -1850,12 +1861,24 @@ def generate_executive_summary(groups: dict, shift_label: str,
         log.warning(f"Only {max_tokens} tokens for output after fitting prompt. "
                     f"Summary will be very brief.")
 
-    # ── Load LLM with dynamic n_ctx ───────────────────────────────────────────
-    try:
-        sum_llm = load_llm_with_ctx(n_ctx, log)
-    except (FileNotFoundError, RuntimeError) as exc:
-        log.critical(f"Step 2 model load failed: {exc}")
-        return "[Executive summary unavailable — Step 2 model failed to load]"
+    # ── Load LLM (or reuse Step 1 instance) ──────────────────────────────────
+    # llm.n_ctx() returns the context size the model was loaded with.
+    # Reuse is safe only when that size covers the prompt + output budget.
+    if reuse_llm is not None and reuse_llm.n_ctx() >= n_ctx:
+        log.info(f"Reusing Step 1 model for Step 2 "
+                 f"(loaded n_ctx={reuse_llm.n_ctx()} ≥ needed {n_ctx} — no reload)")
+        sum_llm    = reuse_llm
+        _sum_owned = False
+    else:
+        if reuse_llm is not None:
+            log.info(f"Step 1 model n_ctx={reuse_llm.n_ctx()} < needed {n_ctx} — "
+                     f"loading Step 2 with larger context")
+        try:
+            sum_llm = load_llm_with_ctx(n_ctx, log)
+        except (FileNotFoundError, RuntimeError) as exc:
+            log.critical(f"Step 2 model load failed: {exc}")
+            return "[Executive summary unavailable — Step 2 model failed to load]"
+        _sum_owned = True
 
     # ── Generate ──────────────────────────────────────────────────────────────
     print("\n" + "═" * 70)
@@ -1890,7 +1913,8 @@ def generate_executive_summary(groups: dict, shift_label: str,
         if not text.strip():
             text = "[Executive summary generation failed — see audit CSV for details]"
     finally:
-        del sum_llm; gc.collect()
+        if _sum_owned:
+            del sum_llm; gc.collect()
     elapsed = time.perf_counter() - t0
 
     if finish_reason == "length":
@@ -2043,7 +2067,6 @@ def main():
     timer.split("Load Step 1 model")
 
     analyzed = run_analyze_entry(llm, records, log, dev)
-    del llm; gc.collect()
     timer.split("Step 1 — analyze_entry")
 
     dev.llm_results(analyzed)
@@ -2067,8 +2090,26 @@ def main():
     write_audit_csv(analyzed, run_ts, log)
 
     # ── STEP 2: executive_summary.prompty ─────────────────────────────────────
-    summary = generate_executive_summary(groups, shift_label, log, dev)
+    # When both steps use the same model file, pass the loaded instance so
+    # Step 2 can skip the reload entirely (~30s saved on CPU).
+    # The model is deleted after Step 2 returns in either branch.
+    same_model = (os.path.abspath(STEP1_MODEL.model_path) ==
+                  os.path.abspath(STEP2_MODEL.model_path))
+    if same_model:
+        log.info("Step 1 and Step 2 use the same model file — skipping reload")
+        step2_reuse = llm
+    else:
+        del llm; gc.collect()
+        timer.split("Unload Step 1 model")
+        step2_reuse = None
+
+    summary = generate_executive_summary(groups, shift_label, log, dev,
+                                          reuse_llm=step2_reuse)
     timer.split("Step 2 — executive_summary")
+
+    if same_model:
+        del llm; gc.collect()
+        timer.split("Unload model")
 
     # ── Save ──────────────────────────────────────────────────────────────────
     out = save_report(summary, groups, analyzed, shift_label, stats, log, run_ts)
