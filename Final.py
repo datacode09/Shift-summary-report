@@ -1439,30 +1439,59 @@ def build_executive_summary_prompt(entries: str, groups: dict,
 
     system = (
         "You are a senior Control Room Operator preparing the executive handover "
-        "summary for the oncoming shift. Be concise, factual, and professional. "
-        "Always name the specific station or equipment when referencing an event.\n\n"
-        "MANDATORY RULE: If any IESO notification occurred during the shift, it MUST "
-        "appear prominently at the very beginning of the summary — before anything else. "
-        f"Include the time of notification. IESO events this shift: {ieso_detail}"
+        "summary for the oncoming shift. Be factual and professional. "
+        "Always name the specific station or equipment when referencing an event. "
+        "Never use bullet points — plain prose only.\n\n"
+        "MANDATORY: If any IESO notification occurred it MUST be stated first, "
+        f"before any other event. IESO events this shift: {ieso_detail}"
     )
 
+    # Build example output scaled to actual event counts so the model
+    # understands the expected length and structure for THIS shift.
+    example_lines = ["[Example of the required format for this shift]"]
+    if n_critical == 0 and n_high == 0:
+        example_lines.append(
+            "Normal shift. No significant events to report. "
+            f"{n_medium} medium-priority items and {n_low} routine items logged."
+        )
+    else:
+        status = "Critical" if n_critical > 0 else "Eventful"
+        ex = [f"{status} shift."]
+        if ieso_events:
+            ex.append(
+                f"IESO was notified at {ieso_events[0].get('ieso_notification_time') or 'HH:MM'} "
+                f"regarding {ieso_events[0]['equip']}."
+            )
+        if n_critical > 0:
+            ex.append(f"[One sentence per CRITICAL event — {n_critical} total, each naming station/equipment.]")
+        if n_high > 0:
+            ex.append(f"[One sentence per HIGH event — {n_high} total, each naming station/equipment.]")
+        if n_medium > 0:
+            ex.append(f"{n_medium} medium-priority events noted including switching operations and minor defects.")
+        if n_low > 0:
+            ex.append(f"{n_low} routine items logged.")
+        example_lines.append(" ".join(ex))
+    example_block = "\n".join(example_lines)
+
     content = (
-        "Generate a concise executive summary from the following prioritized shift "
-        "log entries:\n\n"
-        f"{entries}\n\n"
-        f"Shift: {shift_label}\n"
-        f"Event counts: {n_critical} CRITICAL  {n_high} HIGH  "
+        f"Write the executive handover summary for this shift.\n\n"
+        f"SHIFT: {shift_label}\n"
+        f"EVENT COUNTS: {n_critical} CRITICAL  {n_high} HIGH  "
         f"{n_medium} MEDIUM  {n_low} LOW\n\n"
-        "Writing requirements:\n"
-        "1. Open with the overall shift status: \"normal\", \"eventful\", or \"critical\"\n"
-        "2. If IESO was notified, state this first — name the equipment and the time\n"
-        "3. List every CRITICAL item individually — include station or equipment name\n"
-        "4. List every HIGH item individually — include station or equipment name\n"
-        "5. Do NOT group CRITICAL or HIGH items together\n"
-        "6. Summarize MEDIUM items as a single sentence with a count\n"
-        "7. Acknowledge LOW items with a brief count only\n"
-        "8. Total length: 4-6 sentences maximum\n"
-        "9. Tone: professional control room language — no bullet points, plain prose only"
+        f"ENTRIES:\n{entries}\n\n"
+        f"{example_block}\n\n"
+        "STRUCTURE (follow this order exactly):\n"
+        "  Sentence 1   : Shift status — open with 'Normal shift.', "
+        "'Eventful shift.', or 'Critical shift.'\n"
+        "  Next sentence(s): IESO — if any IESO event occurred, state it here "
+        "with equipment name and notification time\n"
+        f"  Next {n_critical} sentence(s): CRITICAL — one sentence per event, "
+        "name station/equipment, state what happened\n"
+        f"  Next {n_high} sentence(s): HIGH — one sentence per event, "
+        "name station/equipment, state what happened\n"
+        "  One sentence  : MEDIUM — summarize all medium events in one sentence with count\n"
+        "  One sentence  : LOW — acknowledge routine items with count only\n\n"
+        "Write the summary now:"
     )
 
     return STEP2_TEMPLATE.format_prompt(content, system=system)
@@ -1680,7 +1709,7 @@ def generate_executive_summary(groups: dict, shift_label: str,
             temperature=0.2,
             top_k=40,
             top_p=0.9,
-            repeat_penalty=1.15,
+            repeat_penalty=1.05,  # low penalty — station/equipment names must repeat freely
             stream=True,
             echo=False,
         ):
