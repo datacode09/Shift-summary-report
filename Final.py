@@ -381,25 +381,35 @@ class PromptTemplate:
         self.template = model_cfg.template.lower().strip()
 
     def format_prompt(self, content: str,
-                      system: Optional[str] = None) -> str:
+                      system: Optional[str] = None,
+                      response_prefix: str = "") -> str:
         """
         Wrap content in the model's chat template.
+
+        response_prefix — injected at the START of the assistant turn so the
+        model continues from that text rather than deciding whether to echo it.
+        For Mistral (no distinct assistant turn) it is appended immediately
+        after [/INST] with no separator.
+
         system overrides model_cfg.system_prompt if provided.
         """
         sys_text = system if system is not None else self.cfg.system_prompt
 
         if self.template == "mistral":
-            # Mistral has no system role — prepend system text to content
+            # Mistral has no system role — prepend system text to content.
+            # response_prefix sits directly after [/INST]; the model completes it.
             full = f"{sys_text}\n\n{content}".strip() if sys_text else content
-            return f"[INST] {full} [/INST]"
+            prompt = f"[INST] {full} [/INST]"
+            return f"{prompt}{response_prefix}" if response_prefix else prompt
 
         elif self.template == "chatml":
-            # Qwen2.5, Phi-3, many others use ChatML
             parts = []
             if sys_text:
                 parts.append(f"<|im_start|>system\n{sys_text}<|im_end|>")
             parts.append(f"<|im_start|>user\n{content}<|im_end|>")
-            parts.append("<|im_start|>assistant")
+            # Inject prefix inside the assistant turn so the model continues it.
+            asst = "<|im_start|>assistant"
+            parts.append(f"{asst}\n{response_prefix}" if response_prefix else asst)
             return "\n".join(parts)
 
         elif self.template == "llama3":
@@ -409,16 +419,31 @@ class PromptTemplate:
                     f"<|start_header_id|>system<|end_header_id|>\n\n"
                     f"{sys_text}<|eot_id|>"
                 )
-            parts.append(
+            asst_header = (
                 f"<|start_header_id|>user<|end_header_id|>\n\n"
                 f"{content}<|eot_id|>"
                 f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
+            parts.append(
+                f"{asst_header}{response_prefix}" if response_prefix else asst_header
             )
             return "".join(parts)
 
         else:
             raise ValueError(f"Unknown template: '{self.template}'. "
                              f"Use 'mistral', 'chatml', or 'llama3'.")
+
+    def stop_sequences(self) -> list[str]:
+        """
+        Return the native end-of-turn stop tokens for this template.
+        Passed as stop= to every llm() call so the model halts at its natural
+        turn boundary rather than relying on max_tokens or EOS alone.
+        """
+        return {
+            "mistral": ["[INST]", "</s>"],
+            "chatml":  ["<|im_end|>", "<|im_start|>"],
+            "llama3":  ["<|eot_id|>", "<|start_header_id|>"],
+        }.get(self.template, [])
 
     def strip_response(self, raw: str) -> str:
         """
@@ -1083,11 +1108,13 @@ def build_analyze_entry_prompt_labeled(batch: list[dict]) -> str:
         "  SUMMARY   : 1-2 sentences. Name the equipment. State what happened and the "
         "current outcome. Must not contradict REASONING.\n\n"
         f"Example output:\n{LABELED_EXAMPLE}\n\n"
-        f"ENTRIES:\n{chr(10).join(lines)}\n\n"
-        "Your analysis:"
+        f"ENTRIES:\n{chr(10).join(lines)}"
     )
 
-    return STEP1_TEMPLATE.format_prompt(content, system=system)
+    # "Your analysis:" is the response_prefix — injected into the assistant
+    # turn start so the model continues from it rather than echoing it.
+    return STEP1_TEMPLATE.format_prompt(content, system=system,
+                                        response_prefix="Your analysis:")
 
 
 def parse_labeled_response(raw: str, expected: int,
@@ -1265,6 +1292,7 @@ def run_analyze_entry(llm: Llama,
                 top_k=1,
                 top_p=1.0,
                 repeat_penalty=1.0,
+                stop=STEP1_TEMPLATE.stop_sequences(),
                 echo=False,
             )
             raw    = result["choices"][0]["text"]
@@ -1302,7 +1330,9 @@ def run_analyze_entry(llm: Llama,
                 try:
                     solo_result = llm(solo_prompt, max_tokens=solo_max_tokens,
                                       temperature=0.0, top_k=1,
-                                      top_p=1.0, repeat_penalty=1.0, echo=False)
+                                      top_p=1.0, repeat_penalty=1.0,
+                                      stop=STEP1_TEMPLATE.stop_sequences(),
+                                      echo=False)
                     TOKEN_TRACKER.record(solo_result, label=f"solo_{batch_num}_{i}")
                     if not check_finish_reason(solo_result,
                                                f"solo_{batch_num}_{i}", log):
@@ -1376,7 +1406,8 @@ def run_analyze_entry(llm: Llama,
             v_maxtok  = min(350, max(50, int(STEP1_MODEL.n_ctx * 0.90) - v_pt))
             try:
                 v_result = llm(v_prompt, max_tokens=v_maxtok, temperature=0.0,
-                               top_k=1, top_p=1.0, repeat_penalty=1.0, echo=False)
+                               top_k=1, top_p=1.0, repeat_penalty=1.0,
+                               stop=STEP1_TEMPLATE.stop_sequences(), echo=False)
                 TOKEN_TRACKER.record(v_result, label=f"crit_verify_{rec['log_id']}")
                 if not check_finish_reason(v_result, f"crit_verify_{rec['log_id']}", log):
                     log.warning(f"  CRITICAL verify {rec['log_id']}: truncated — keeping original")
@@ -1574,10 +1605,12 @@ def build_executive_summary_prompt(entries: str, groups: dict,
         f"{SUMMARY_EXAMPLE}\n\n"
         "WRITE THE SUMMARY IN THIS EXACT SECTION ORDER:\n"
         + "\n".join(sections)
-        + "\n\nSummary:"
     )
 
-    return STEP2_TEMPLATE.format_prompt(content, system=system)
+    # "Summary:" is the response_prefix — injected into the assistant turn
+    # start so the model writes the summary directly without deciding to echo.
+    return STEP2_TEMPLATE.format_prompt(content, system=system,
+                                        response_prefix="Summary:")
 
 
 def load_llm_with_ctx(n_ctx: int, log: logging.Logger) -> Llama:
@@ -1648,16 +1681,17 @@ def hierarchical_summarise(llm: Llama, groups: dict,
         chunk_content = (
             "Summarise these HIGH priority electricity system events in 2-3 sentences. "
             "Name each station and what happened. Plain prose, no bullets.\n\n"
-            f"EVENTS:\n{chr(10).join(lines)}\n\n"
-            "Summary:"
+            f"EVENTS:\n{chr(10).join(lines)}"
         )
         chunk_prompt = STEP2_TEMPLATE.format_prompt(
             chunk_content,
             system="You are a grid operations analyst for an electricity transmission system.",
+            response_prefix="Summary:",
         )
         try:
             result   = llm(chunk_prompt, max_tokens=300, temperature=0.1,
-                           top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
+                           top_k=40, top_p=0.9, repeat_penalty=1.1,
+                           stop=STEP2_TEMPLATE.stop_sequences(), echo=False)
             TOKEN_TRACKER.record(result, label=f"hier_chunk_{chunk_num}")
             check_finish_reason(result, f"hier_chunk_{chunk_num}", log)
             raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
@@ -1793,6 +1827,7 @@ def generate_executive_summary(groups: dict, shift_label: str,
             top_k=40,
             top_p=0.9,
             repeat_penalty=1.05,  # low penalty — station/equipment names must repeat freely
+            stop=STEP2_TEMPLATE.stop_sequences(),
             stream=True,
             echo=False,
         ):
