@@ -397,10 +397,12 @@ class PromptTemplate:
 
         if self.template == "mistral":
             # Mistral has no system role — prepend system text to content.
-            # response_prefix sits directly after [/INST]; the model completes it.
+            # Space before response_prefix matches training format: [/INST] response
+            # (SentencePiece encodes the leading space into the first word token;
+            # omitting it shifts the token distribution away from training data.)
             full = f"{sys_text}\n\n{content}".strip() if sys_text else content
             prompt = f"[INST] {full} [/INST]"
-            return f"{prompt}{response_prefix}" if response_prefix else prompt
+            return f"{prompt} {response_prefix}" if response_prefix else prompt
 
         elif self.template == "chatml":
             parts = []
