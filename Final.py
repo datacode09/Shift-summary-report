@@ -772,7 +772,9 @@ def find_col(df: pd.DataFrame, *kws) -> Optional[str]:
     return None
 
 def approx_tokens(text: str) -> int:
-    return max(1, int(len(text) / 3.5))
+    # Operator logs (codes, timestamps, abbreviations) tokenize denser than prose;
+    # 3.0 chars/token is more accurate than the prose-optimised 3.5 estimate.
+    return max(1, int(len(text) / 3.0))
 
 
 def check_finish_reason(result: dict, label: str, log: logging.Logger) -> bool:
@@ -917,8 +919,9 @@ def prepare_rows(df: pd.DataFrame, log: logging.Logger) -> list[dict]:
 #   • Models produce simple key: value lines far more reliably than JSON arrays
 #   • Partial batches (model stops after N of M records) still return N records
 #
-# Format the model must write:
+# Format the model must write (REASONING first so classification follows committed reasoning):
 #   RECORD 1
+#   REASONING: One sentence explaining the classification decision.
 #   INCLUDE: yes
 #   PRIORITY: CRITICAL
 #   IESO: yes
@@ -934,17 +937,22 @@ def prepare_rows(df: pd.DataFrame, log: logging.Logger) -> list[dict]:
 _LABELED_RECORD_RE = re.compile(r"\b(?:RECORD|ENTRY)\s+(\d+)\b", re.IGNORECASE)
 _TIME_HHMI_RE      = re.compile(r"^\d{1,2}:\d{2}$")   # HH:MM validation — pre-compiled
 _LABELED_FIELDS    = {
-    "include":  re.compile(r"\bINCLUDE\s*[:=]\s*(yes|no|true|false)\b",             re.IGNORECASE),
-    "priority": re.compile(r"\bPRIORITY\s*[:=]\s*(CRITICAL|HIGH|MEDIUM|LOW)\b",     re.IGNORECASE),
-    "ieso":     re.compile(r"\bIESO\s*[:=]\s*(yes|no|true|false)\b",                re.IGNORECASE),
-    "time":     re.compile(r"\bTIME\s*[:=]\s*(\d{1,2}:\d{2}|none|null|n/?a)\b",    re.IGNORECASE),
+    # REASONING is parsed for audit logging only — not stored in the record dict.
+    # It must come first so the model commits to its reasoning before classifying.
+    "reasoning": re.compile(r"\bREASONING\s*[:=]\s*(.+?)(?=\n\s*\b(?:INCLUDE|PRIORITY|IESO|TIME|SUMMARY)\b)",
+                            re.IGNORECASE | re.DOTALL),
+    "include":   re.compile(r"\bINCLUDE\s*[:=]\s*(yes|no|true|false)\b",            re.IGNORECASE),
+    "priority":  re.compile(r"\bPRIORITY\s*[:=]\s*(CRITICAL|HIGH|MEDIUM|LOW)\b",    re.IGNORECASE),
+    "ieso":      re.compile(r"\bIESO\s*[:=]\s*(yes|no|true|false)\b",               re.IGNORECASE),
+    "time":      re.compile(r"\bTIME\s*[:=]\s*(\d{1,2}:\d{2}|none|null|n/?a)\b",   re.IGNORECASE),
     # Lookahead accepts both RECORD and ENTRY as block separators
-    "summary":  re.compile(r"\bSUMMARY\s*[:=]\s*(.+?)(?=\n\s*(?:(?:RECORD|ENTRY)\s+\d+|---)|$)",
-                           re.IGNORECASE | re.DOTALL),
+    "summary":   re.compile(r"\bSUMMARY\s*[:=]\s*(.+?)(?=\n\s*(?:(?:RECORD|ENTRY)\s+\d+|---)|$)",
+                            re.IGNORECASE | re.DOTALL),
 }
 
 LABELED_EXAMPLE = (
     "RECORD 1\n"
+    "REASONING: Unplanned feeder trip with IESO notification — operationally significant, CRITICAL.\n"
     "INCLUDE: yes\n"
     "PRIORITY: CRITICAL\n"
     "IESO: yes\n"
@@ -952,6 +960,7 @@ LABELED_EXAMPLE = (
     "SUMMARY: Midtown feeder tripped at 14:23; IESO notified at 14:31, supply restored 15:45.\n"
     "---\n"
     "RECORD 2\n"
+    "REASONING: Protection operated and cleared fault normally — significant but no IESO, HIGH.\n"
     "INCLUDE: yes\n"
     "PRIORITY: HIGH\n"
     "IESO: no\n"
@@ -959,6 +968,7 @@ LABELED_EXAMPLE = (
     "SUMMARY: Longwood TS breaker 52A operated; protection cleared fault normally.\n"
     "---\n"
     "RECORD 3\n"
+    "REASONING: Completed routine switching with no issues — no operational significance.\n"
     "INCLUDE: no\n"
     "PRIORITY: LOW\n"
     "IESO: no\n"
@@ -1005,7 +1015,9 @@ def build_analyze_entry_prompt_labeled(batch: list[dict]) -> str:
     content = (
         f"Analyze these {n} operational log entries. "
         "For EACH entry write exactly one labeled block, in order, separated by ---.\n\n"
-        "FIELD RULES:\n"
+        "FIELD RULES (write in this order):\n"
+        "  REASONING: 1 sentence — identify what happened and why it matters "
+        "before you classify. This guides all fields below.\n"
         "  INCLUDE  : yes — operational significance; "
         "no — routine/vague/no value\n"
         "  PRIORITY : CRITICAL (trips/outages/IESO notifications) | "
@@ -1015,7 +1027,7 @@ def build_analyze_entry_prompt_labeled(batch: list[dict]) -> str:
         "  IESO     : yes if comment mentions IESO notified / informed / "
         "Compliance notified / any similar phrasing; otherwise no\n"
         "  TIME     : 24h time from comment (e.g. 14:31) or none\n"
-        "  SUMMARY  : 1-2 sentence operational summary. "
+        "  SUMMARY  : 1-2 sentence operational summary consistent with REASONING. "
         "Plain prose, no bullets. Focus on what happened, not procedural detail.\n\n"
         f"Example:\n{LABELED_EXAMPLE}\n\n"
         f"ENTRIES:\n{chr(10).join(lines)}\n\n"
@@ -1048,12 +1060,16 @@ def parse_labeled_response(raw: str, expected: int,
         end    = splits[idx + 1].start() if idx + 1 < len(splits) else len(raw)
         block  = raw[start:end]
 
-        inc_m  = _LABELED_FIELDS["include"].search(block)
-        pri_m  = _LABELED_FIELDS["priority"].search(block)
-        ieso_m = _LABELED_FIELDS["ieso"].search(block)
-        time_m = _LABELED_FIELDS["time"].search(block)
-        sum_m  = _LABELED_FIELDS["summary"].search(block)
+        reason_m = _LABELED_FIELDS["reasoning"].search(block)
+        inc_m    = _LABELED_FIELDS["include"].search(block)
+        pri_m    = _LABELED_FIELDS["priority"].search(block)
+        ieso_m   = _LABELED_FIELDS["ieso"].search(block)
+        time_m   = _LABELED_FIELDS["time"].search(block)
+        sum_m    = _LABELED_FIELDS["summary"].search(block)
 
+        if not reason_m:
+            log.debug(f"Batch {batch_num}: RECORD {rec_id} missing REASONING — "
+                      f"model skipped the reasoning step")
         if not (inc_m and pri_m and sum_m):
             log.debug(f"Batch {batch_num}: RECORD {rec_id} missing required fields — skipping")
             continue
@@ -1293,6 +1309,49 @@ def run_analyze_entry(llm: Llama,
                  f"✓ {inc}/{n} included  {elapsed:.1f}s  {batch[0]['equip'][:25]}")
         all_done.extend(batch)
 
+    # ── CRITICAL re-verification ──────────────────────────────────────────────
+    # Batch processing splits model attention across N records. For CRITICAL
+    # records specifically — where a wrong classification has operational
+    # consequences — re-run each individually to confirm.
+    crit_indices = [i for i, r in enumerate(all_done) if r.get("priority") == "CRITICAL"]
+    if crit_indices:
+        log.info(f"Re-verifying {len(crit_indices)} CRITICAL record(s) individually")
+        for idx in crit_indices:
+            rec = all_done[idx]
+            v_prompt  = build_analyze_entry_prompt_labeled([rec])
+            v_pt      = approx_tokens(v_prompt)
+            v_maxtok  = min(350, max(50, int(STEP1_MODEL.n_ctx * 0.90) - v_pt))
+            try:
+                v_result = llm(v_prompt, max_tokens=v_maxtok, temperature=0.0,
+                               top_k=1, top_p=1.0, repeat_penalty=1.0, echo=False)
+                TOKEN_TRACKER.record(v_result, label=f"crit_verify_{rec['log_id']}")
+                if not check_finish_reason(v_result, f"crit_verify_{rec['log_id']}", log):
+                    log.warning(f"  CRITICAL verify {rec['log_id']}: truncated — keeping original")
+                    continue
+                v_raw    = strip_prompt_echo(v_result["choices"][0]["text"], v_prompt, STEP1_TEMPLATE)
+                v_parsed = parse_labeled_response(v_raw, 1, log, 0)
+            except Exception as exc:
+                log.warning(f"  CRITICAL verify {rec['log_id']}: LLM error ({exc}) — keeping original")
+                continue
+
+            if v_parsed and len(v_parsed) >= 1:
+                v = v_parsed[0]
+                new_pri = str(v["priority"]).upper()
+                if new_pri != rec.get("priority"):
+                    log.warning(f"  CRITICAL verify {rec['log_id']}: "
+                                f"batch={rec['priority']} → solo={new_pri} — updating to solo result")
+                else:
+                    log.info(f"  CRITICAL verify {rec['log_id']}: confirmed ✓")
+                rec.update({
+                    "should_include":         bool(v["should_include"]),
+                    "priority":               new_pri,
+                    "summary":                strip_ctrl(str(v.get("summary", "")))[:300],
+                    "ieso_notified":          bool(v["ieso_notified"]),
+                    "ieso_notification_time": v.get("ieso_notification_time"),
+                })
+            else:
+                log.warning(f"  CRITICAL verify {rec['log_id']}: solo parse failed — keeping original")
+
     included = sum(1 for r in all_done if r["should_include"])
     log.info(f"Step 1 complete: {len(all_done):,} processed  "
              f"included={included}  parse_fails={parse_fails}")
@@ -1515,12 +1574,11 @@ def hierarchical_summarise(llm: Llama, groups: dict,
     for ms in high_mini_summaries:
         compressed_lines.append(f"[HIGH] {ms}")
 
-    # MEDIUM — count + one-line each
+    # MEDIUM — one line per event; all records included so none are invisible to Step 2
     if mediums:
+        medium_parts = [f"{e['equip']} ({e['summary'][:60]})" for e in mediums]
         compressed_lines.append(
-            f"[MEDIUM] {len(mediums)} events: " +
-            "; ".join(f"{e['equip']} ({e['summary'][:60]})" for e in mediums[:5]) +
-            (f" and {len(mediums)-5} more" if len(mediums) > 5 else "")
+            f"[MEDIUM] {len(mediums)} events: " + "; ".join(medium_parts)
         )
 
     # LOW — count only

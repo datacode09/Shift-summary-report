@@ -6,7 +6,7 @@
   "logs_dir":         "./logs",
   "dev_dir":          "./dev",
 
-  "llm_batch_size":       10,
+  "llm_batch_size":       5,
   "max_comment_chars":    400,
   "target_output_tokens": 800,
   "dev_mode":             true,
