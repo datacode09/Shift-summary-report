@@ -1084,9 +1084,10 @@ def build_analyze_entry_prompt_labeled(batch: list[dict]) -> str:
     )
 
     content = (
-        f"Classify {n} operational log entries. "
-        "Write one labeled block per entry in the same order as the entries, "
-        "separated by ---.\n\n"
+        f"Classify exactly {n} operational log entries. "
+        f"Write exactly {n} labeled blocks numbered RECORD 1 through RECORD {n}, "
+        f"in the same order as the entries, separated by ---. "
+        f"Stop after RECORD {n}.\n\n"
         "FIELDS — write in this exact order for every block:\n"
         "  REASONING : One sentence. Name the equipment, state the event type, "
         "and note any regulatory implication (IESO / Compliance). "
@@ -1270,8 +1271,9 @@ def run_analyze_entry(llm: Llama,
         # Labeled-text prompt: model writes key:value lines, Python builds the JSON
         prompt     = build_analyze_entry_prompt_labeled(batch)
         pt         = approx_tokens(prompt)
-        # ~150 tokens structured output + 50 tokens summary headroom per record
-        max_tokens = n * 200
+        # Mistral 7B writes longer REASONING + SUMMARY than smaller models;
+        # 300 tokens/record gives headroom without inflating context beyond 4K.
+        max_tokens = n * 300
 
         budget = int(STEP1_MODEL.n_ctx * 0.90) - pt
         if budget < n * 50:
@@ -1320,12 +1322,12 @@ def run_analyze_entry(llm: Llama,
             for i, rec in enumerate(batch, 1):
                 solo_prompt      = build_analyze_entry_prompt_labeled([rec])
                 solo_pt          = approx_tokens(solo_prompt)
-                solo_max_tokens  = 350
+                solo_max_tokens  = 500
                 solo_budget      = int(STEP1_MODEL.n_ctx * 0.90) - solo_pt
                 if solo_budget < solo_max_tokens:
                     solo_max_tokens = max(50, solo_budget)
                     log.warning(f"  Solo retry record {i}: prompt~{solo_pt}tok — "
-                                f"capping max_tokens 350→{solo_max_tokens}")
+                                f"capping max_tokens 500→{solo_max_tokens}")
                 try:
                     solo_result = llm(solo_prompt, max_tokens=solo_max_tokens,
                                       temperature=0.0, top_k=1,
@@ -1381,7 +1383,7 @@ def run_analyze_entry(llm: Llama,
                 mrec = batch[mid - 1]
                 m_prompt  = build_analyze_entry_prompt_labeled([mrec])
                 m_pt      = approx_tokens(m_prompt)
-                m_maxtok  = 350
+                m_maxtok  = 500
                 m_budget  = int(STEP1_MODEL.n_ctx * 0.90) - m_pt
                 if m_budget < m_maxtok:
                     m_maxtok = max(50, m_budget)
@@ -1446,7 +1448,7 @@ def run_analyze_entry(llm: Llama,
             rec = all_done[idx]
             v_prompt  = build_analyze_entry_prompt_labeled([rec])
             v_pt      = approx_tokens(v_prompt)
-            v_maxtok  = min(350, max(50, int(STEP1_MODEL.n_ctx * 0.90) - v_pt))
+            v_maxtok  = min(500, max(50, int(STEP1_MODEL.n_ctx * 0.90) - v_pt))
             try:
                 v_result = llm(v_prompt, max_tokens=v_maxtok, temperature=0.0,
                                top_k=1, top_p=1.0, repeat_penalty=1.0,
