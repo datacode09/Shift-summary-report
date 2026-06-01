@@ -217,6 +217,7 @@ MAX_COMMENT_CHARS = _cfg.get("max_comment_chars", 400)
 DEV_MODE          = _cfg.get("dev_mode",          False)
 N_THREADS         = _cfg.get("n_threads",         4)
 N_BATCH           = _cfg.get("n_batch",           512)
+TARGET_OUTPUT     = _cfg.get("target_output_tokens", 800)  # Step 2 max completion tokens
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TWO-MODEL ARCHITECTURE
@@ -774,6 +775,18 @@ def approx_tokens(text: str) -> int:
     return max(1, int(len(text) / 3.5))
 
 
+def check_finish_reason(result: dict, label: str, log: logging.Logger) -> bool:
+    """Return True if generation completed naturally (finish_reason='stop').
+    Return False and log a warning if truncated by max_tokens (finish_reason='length').
+    """
+    reason = (result.get("choices") or [{}])[0].get("finish_reason", "unknown")
+    if reason == "length":
+        log.warning(f"{label}: generation hit max_tokens limit (finish_reason=length) — "
+                    f"response may be incomplete; check token budgets")
+        return False
+    return True
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING & SHIFT FILTER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1162,8 +1175,8 @@ def run_analyze_entry(llm: Llama,
         # Labeled-text prompt: model writes key:value lines, Python builds the JSON
         prompt     = build_analyze_entry_prompt_labeled(batch)
         pt         = approx_tokens(prompt)
-        # Labeled format is compact: ~100 tokens/record + summary headroom
-        max_tokens = n * 150
+        # ~150 tokens structured output + 50 tokens summary headroom per record
+        max_tokens = n * 200
 
         budget = int(STEP1_MODEL.n_ctx * 0.90) - pt
         if budget < n * 50:
@@ -1188,7 +1201,14 @@ def run_analyze_entry(llm: Llama,
             raw    = result["choices"][0]["text"]
             clean  = strip_prompt_echo(raw, prompt, STEP1_TEMPLATE)
             TOKEN_TRACKER.record(result, label=f"batch_{batch_num}")
+            truncated = not check_finish_reason(result, f"batch_{batch_num}", log)
             parsed = parse_labeled_response(clean, n, log, batch_num)
+            if truncated and parsed is not None and len(parsed) < n:
+                # Batch was cut off mid-output — some records at the end are missing;
+                # force solo retry so no record is silently dropped.
+                log.warning(f"Batch {batch_num}: truncated response returned only "
+                            f"{len(parsed)}/{n} records — forcing per-record retry")
+                parsed = None
             dev.llm_batch(batch_num, prompt, clean, parsed)
         except Exception as exc:
             log.error(f"Batch {batch_num}: LLM inference error "
@@ -1204,20 +1224,28 @@ def run_analyze_entry(llm: Llama,
             for i, rec in enumerate(batch, 1):
                 solo_prompt      = build_analyze_entry_prompt_labeled([rec])
                 solo_pt          = approx_tokens(solo_prompt)
-                solo_max_tokens  = 200
+                solo_max_tokens  = 350
                 solo_budget      = int(STEP1_MODEL.n_ctx * 0.90) - solo_pt
                 if solo_budget < solo_max_tokens:
                     solo_max_tokens = max(50, solo_budget)
                     log.warning(f"  Solo retry record {i}: prompt~{solo_pt}tok — "
-                                f"capping max_tokens 200→{solo_max_tokens}")
+                                f"capping max_tokens 350→{solo_max_tokens}")
                 try:
                     solo_result = llm(solo_prompt, max_tokens=solo_max_tokens,
                                       temperature=0.0, top_k=1,
                                       top_p=1.0, repeat_penalty=1.0, echo=False)
                     TOKEN_TRACKER.record(solo_result, label=f"solo_{batch_num}_{i}")
-                    solo_raw    = strip_prompt_echo(
-                        solo_result["choices"][0]["text"], solo_prompt, STEP1_TEMPLATE)
-                    solo_parsed = parse_labeled_response(solo_raw, 1, log, batch_num)
+                    if not check_finish_reason(solo_result,
+                                               f"solo_{batch_num}_{i}", log):
+                        # Single record hit max_tokens — output is incomplete;
+                        # safe_default is more honest than a partial parse.
+                        log.error(f"  Solo retry record {i} ({rec['log_id']}): "
+                                  f"truncated at max_tokens — using safe default")
+                        solo_parsed = None
+                    else:
+                        solo_raw    = strip_prompt_echo(
+                            solo_result["choices"][0]["text"], solo_prompt, STEP1_TEMPLATE)
+                        solo_parsed = parse_labeled_response(solo_raw, 1, log, batch_num)
                 except Exception as exc:
                     log.error(f"  Solo retry record {i} ({rec['log_id']}): "
                               f"LLM error ({type(exc).__name__}: {exc})")
@@ -1457,9 +1485,10 @@ def hierarchical_summarise(llm: Llama, groups: dict,
             system="You are a grid operations analyst for an electricity transmission system.",
         )
         try:
-            result   = llm(chunk_prompt, max_tokens=150, temperature=0.1,
+            result   = llm(chunk_prompt, max_tokens=300, temperature=0.1,
                            top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
             TOKEN_TRACKER.record(result, label=f"hier_chunk_{chunk_num}")
+            check_finish_reason(result, f"hier_chunk_{chunk_num}", log)
             raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
             mini_sum = raw.strip()
             log.info(f"  HIGH chunk {chunk_num}: {len(chunk)} records → mini-summary done")
@@ -1516,7 +1545,6 @@ def generate_executive_summary(groups: dict, shift_label: str,
       6. If entries still too large → hierarchical summarisation first
       7. Generate and return summary
     """
-    TARGET_OUTPUT   = 600    # per executive_summary.prompty parameters
     MIN_OUTPUT      = 200    # minimum acceptable output tokens
     RAM_SAFE_MAX    = 16_384 # max n_ctx before RAM becomes a concern
 
@@ -1584,8 +1612,9 @@ def generate_executive_summary(groups: dict, shift_label: str,
     print(f"  STEP 2 — EXECUTIVE SUMMARY  "
           f"(n_ctx={n_ctx}  max_tokens={max_tokens})")
     print("═" * 70 + "\n")
-    text = ""
-    t0   = time.perf_counter()
+    text          = ""
+    finish_reason = "unknown"
+    t0            = time.perf_counter()
     try:
         for chunk in sum_llm(
             prompt,
@@ -1597,9 +1626,13 @@ def generate_executive_summary(groups: dict, shift_label: str,
             stream=True,
             echo=False,
         ):
-            tok = chunk["choices"][0]["text"]
+            choice = chunk["choices"][0]
+            tok    = choice["text"]
             print(tok, end="", flush=True)
             text += tok
+            # llama-cpp sets finish_reason on the final chunk only
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
     except Exception as exc:
         log.error(f"Executive summary generation failed mid-stream "
                   f"({type(exc).__name__}: {exc})")
@@ -1608,6 +1641,13 @@ def generate_executive_summary(groups: dict, shift_label: str,
     finally:
         del sum_llm; gc.collect()
     elapsed = time.perf_counter() - t0
+
+    if finish_reason == "length":
+        log.warning(f"Executive summary truncated at max_tokens={max_tokens} — "
+                    f"summary is incomplete. Increase target_output_tokens in config.json "
+                    f"(currently {TARGET_OUTPUT})")
+        text += "\n[Note: summary truncated — increase target_output_tokens in config.json]"
+
     print("\n")
 
     # Step 10: token tracking — streaming chunks carry no usage dict; approximate

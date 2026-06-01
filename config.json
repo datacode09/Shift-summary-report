@@ -6,14 +6,15 @@
   "logs_dir":         "./logs",
   "dev_dir":          "./dev",
 
-  "llm_batch_size":    10,
-  "max_comment_chars": 400,
-  "dev_mode":          true,
-  "n_threads":         4,
-  "n_batch":           512,
-  "n_ctx":             4096,
-  "n_gpu_layers":      0,
-  "f16_kv":            true,
+  "llm_batch_size":       10,
+  "max_comment_chars":    400,
+  "target_output_tokens": 800,
+  "dev_mode":             true,
+  "n_threads":            4,
+  "n_batch":              512,
+  "n_ctx":                4096,
+  "n_gpu_layers":         0,
+  "f16_kv":               true,
 
   "step1_model": {
     "model_path":  "./qwen2.5-3b-instruct-q4_k_m.gguf",
