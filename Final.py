@@ -878,7 +878,7 @@ def prepare_rows(df: pd.DataFrame, log: logging.Logger) -> list[dict]:
     cc  = find_col(df,"comment");  cdc = find_col(df,"code")
     eqc = find_col(df,"equipment","equip")
     sec = find_col(df,"sector");   cpc = find_col(df,"complet")
-    idc = find_col(df,"log_id","logid","log id")
+    idc = find_col(df,"log_id","logid","log id","log_item","item_id","log item")
     log.debug(f"Cols: start={sc} end={ec} comment={cc} code={cdc} "
               f"equip={eqc} sector={sec} completed={cpc} id={idc}")
 
