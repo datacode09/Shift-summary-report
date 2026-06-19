@@ -1233,6 +1233,7 @@ def run_analyze_entry(llm: Llama,
                     log.error(f"  Solo retry ✗ | {rec['log_id']} | "
                               f"defaulting to skip")
             all_done.extend(batch)
+            llm.reset()
             continue
 
         # Apply parsed results
@@ -1259,6 +1260,7 @@ def run_analyze_entry(llm: Llama,
         log.info(f"Batch {batch_num:4d} [{start+n:5d}/{total:5d}]  "
                  f"✓ {inc}/{n} included  {elapsed:.1f}s  {batch[0]['equip'][:25]}")
         all_done.extend(batch)
+        llm.reset()
 
     included = sum(1 for r in all_done if r["should_include"])
     log.info(f"Step 1 complete: {len(all_done):,} processed  "
