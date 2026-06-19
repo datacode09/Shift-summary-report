@@ -243,7 +243,11 @@ try:
 except ImportError:
     _PHYS_CORES = max(1, (os.cpu_count() or 8) // 2)
 
-N_THREADS = _cfg.get("n_threads", _PHYS_CORES)
+# On Intel 12th Gen+ laptops, psutil counts P-Cores + E-Cores as physical cores.
+# E-Cores desynchronize during LLM tensor ops and hurt throughput.
+# Set "n_threads" in config.json to your exact P-Core count to override.
+# Common values: 6 (i7/i9 ultrabooks), 8 (i9 high-perf laptops).
+N_THREADS = _cfg.get("n_threads", 6)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TWO-MODEL ARCHITECTURE
@@ -919,8 +923,13 @@ def filter_shift(df: pd.DataFrame, log: logging.Logger) -> pd.DataFrame:
 def clean_comment(raw) -> str:
     if pd.isna(raw) or str(raw).strip().upper() in ("N/A","NA","NAN","NONE",""):
         return ""
-    t = strip_ctrl(str(raw).strip())
-    return re.sub(r"\s+", " ", t)[:MAX_COMMENT_CHARS]
+    raw_str = str(raw).strip()
+    t = strip_ctrl(raw_str)
+    cleaned = re.sub(r"\s+", " ", t)[:MAX_COMMENT_CHARS]
+    # If truncation dropped an IESO mention, surface it so Step 1 can flag it.
+    if len(raw_str) > MAX_COMMENT_CHARS and "IESO" in raw_str.upper() and "IESO" not in cleaned.upper():
+        cleaned += " [IESO NOTIFIED]"
+    return cleaned
 
 def build_ts(row, sc, ec) -> str:
     parts = []
@@ -1233,8 +1242,10 @@ def run_analyze_entry(llm: Llama,
                         f"retrying {n} records individually")
             for i, rec in enumerate(batch, 1):
                 solo_prompt  = build_analyze_entry_prompt([rec])
+                # temperature=0.15 so a deterministic JSON syntax error isn't
+                # repeated verbatim on the retry.
                 solo_result  = llm(solo_prompt, max_tokens=150,
-                                   temperature=0.0, top_k=1,
+                                   temperature=0.15, top_k=5,
                                    top_p=1.0, repeat_penalty=1.0, echo=False)
                 solo_raw     = strip_prompt_echo(
                     solo_result["choices"][0]["text"], solo_prompt, STEP1_TEMPLATE)
@@ -1284,6 +1295,7 @@ def run_analyze_entry(llm: Llama,
                  f"✓ {inc}/{n} included  {elapsed:.1f}s  {batch[0]['equip'][:25]}")
         all_done.extend(batch)
         llm.reset()
+        time.sleep(1.5)  # thermal pacing — lets the heatsink recover between batches
 
     included = sum(1 for r in all_done if r["should_include"])
     log.info(f"Step 1 complete: {len(all_done):,} processed  "
