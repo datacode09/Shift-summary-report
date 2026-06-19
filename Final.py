@@ -1270,7 +1270,9 @@ def run_analyze_entry(llm: Llama,
         t0         = time.perf_counter()
         prompt     = build_analyze_entry_prompt(batch)
         pt         = approx_tokens(prompt)
-        max_tokens = n * 250   # Mistral writes longer summaries than smaller models
+        # ~100 tokens per record covers the full JSON object with summary field.
+        # 250 was over-generous and wasted context on smaller models like Qwen2.5-3B.
+        max_tokens = n * 100
 
         if pt + max_tokens > LLM_CONFIG["n_ctx"] * 0.90:
             log.warning(f"Batch {batch_num}: prompt~{pt}tok near context limit")
@@ -1278,10 +1280,10 @@ def run_analyze_entry(llm: Llama,
         result = llm(
             prompt,
             max_tokens=max_tokens,
-            temperature=0.0,
-            top_k=1,
-            top_p=1.0,
-            repeat_penalty=1.0,
+            temperature=0.0,   # fully deterministic — JSON must be exact
+            top_k=1,           # greedy: only the highest-probability token
+            top_p=1.0,         # top_p inactive when top_k=1
+            repeat_penalty=1.0, # no penalty — JSON keys repeat legitimately
             echo=False,
         )
         raw     = result["choices"][0]["text"]
@@ -1302,7 +1304,7 @@ def run_analyze_entry(llm: Llama,
                 solo_prompt  = build_analyze_entry_prompt([rec])
                 # temperature=0.15 so a deterministic JSON syntax error isn't
                 # repeated verbatim on the retry.
-                solo_result  = llm(solo_prompt, max_tokens=150,
+                solo_result  = llm(solo_prompt, max_tokens=200,
                                    temperature=0.15, top_k=5,
                                    top_p=1.0, repeat_penalty=1.0, echo=False)
                 solo_raw     = strip_prompt_echo(
@@ -1546,8 +1548,8 @@ def hierarchical_summarise(llm: Llama, groups: dict,
             chunk_content,
             system="You are a grid operations analyst for an electricity transmission system.",
         )
-        result   = llm(chunk_prompt, max_tokens=150, temperature=0.1,
-                       top_k=40, top_p=0.9, repeat_penalty=1.1, echo=False)
+        result   = llm(chunk_prompt, max_tokens=200, temperature=0.1,
+                       top_k=25, top_p=0.9, repeat_penalty=1.05, echo=False)
         raw      = strip_prompt_echo(result["choices"][0]["text"], chunk_prompt, STEP2_TEMPLATE)
         mini_sum = raw.strip()
         high_mini_summaries.append(f"HIGH events (group {chunk_num}): {mini_sum}")
@@ -1600,7 +1602,7 @@ def generate_executive_summary(groups: dict, shift_label: str,
       6. If entries still too large → hierarchical summarisation first
       7. Generate and return summary
     """
-    TARGET_OUTPUT   = 600    # per executive_summary.prompty parameters
+    TARGET_OUTPUT   = 800    # 600 was too short for shifts with multiple CRITICAL/HIGH events
     MIN_OUTPUT      = 200    # minimum acceptable output tokens
     RAM_SAFE_MAX    = 16_384 # max n_ctx before RAM becomes a concern
 
@@ -1663,10 +1665,12 @@ def generate_executive_summary(groups: dict, shift_label: str,
     for chunk in sum_llm(
         prompt,
         max_tokens=max_tokens,
-        temperature=0.2,
-        top_k=40,
-        top_p=0.9,
-        repeat_penalty=1.15,
+        temperature=0.2,   # low enough for factual accuracy, enough for natural prose
+        top_k=25,          # tighter than 40 — reduces low-quality token paths for formal writing
+        top_p=0.9,         # nucleus sampling keeps output on-distribution
+        min_p=0.05,        # prunes tokens with probability < 5% of top token — cleaner sentences
+        repeat_penalty=1.07, # 1.15 was suppressing legitimate equipment name repetition;
+                             # 1.07 discourages filler repetition without penalising domain terms
         stream=True,
         echo=False,
     ):
