@@ -416,6 +416,14 @@ VALID_PRIORITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
 # Abstracts chat format differences so prompts work with any model family.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _strip_think_blocks(text: str) -> str:
+    """
+    Remove <think>...</think> blocks emitted by Qwen3 in thinking mode.
+    Applied universally — harmless for models that never emit these tokens.
+    """
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
 class PromptTemplate:
     """
     Wraps a ModelConfig and provides format_prompt() to wrap content in the
@@ -430,7 +438,9 @@ class PromptTemplate:
     phi3    : <|system|>\\n{sys}<|end|>\\n<|user|>\\n{content}<|end|>\\n<|assistant|>\\n
               (Phi-3 / Phi-4-mini — distinct from ChatML despite visual similarity)
     gemma   : <start_of_turn>user\\n{content}<end_of_turn>\\n<start_of_turn>model\\n
-              (Gemma 2/3 — no dedicated system role)
+              (Gemma 2/3/4 — no dedicated system role)
+    qwen3   : ChatML + /no_think appended to user turn to suppress <think> blocks
+              (Qwen3 / Qwen3.5 — thinking mode disabled for deterministic JSON output)
     """
 
     def __init__(self, model_cfg: ModelConfig):
@@ -483,18 +493,31 @@ class PromptTemplate:
             return "\n".join(parts)
 
         elif self.template == "gemma":
-            # Gemma 2/3 — no dedicated system role; system text prepended to user turn
+            # Gemma 2/3/4 — no dedicated system role; system text prepended to user turn
             full = f"{sys_text}\n\n{content}".strip() if sys_text else content
             return f"<start_of_turn>user\n{full}<end_of_turn>\n<start_of_turn>model\n"
 
+        elif self.template == "qwen3":
+            # Qwen3 / Qwen3.5 — ChatML format with /no_think to disable reasoning mode.
+            # Without this, the model emits <think>...</think> before every response,
+            # which breaks JSON parsing in Step 1 and inflates token usage.
+            parts = []
+            if sys_text:
+                parts.append(f"<|im_start|>system\n{sys_text}<|im_end|>")
+            parts.append(f"<|im_start|>user\n{content}\n/no_think<|im_end|>")
+            parts.append("<|im_start|>assistant")
+            return "\n".join(parts)
+
         else:
             raise ValueError(f"Unknown template: '{self.template}'. "
-                             f"Use 'mistral', 'chatml', 'llama3', 'phi3', or 'gemma'.")
+                             f"Use 'mistral', 'chatml', 'llama3', 'phi3', 'gemma', or 'qwen3'.")
 
     def strip_response(self, raw: str) -> str:
         """
         Strip echoed prompt from raw LLM output.
         Each template has a different end-of-prompt marker.
+        <think> blocks are stripped universally — they appear in Qwen3 output
+        even when /no_think is set if the model partially ignores it.
         """
         markers = {
             "mistral": "[/INST]",
@@ -502,12 +525,12 @@ class PromptTemplate:
             "llama3":  "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "phi3":    "<|assistant|>",
             "gemma":   "<start_of_turn>model\n",
+            "qwen3":   "<|im_start|>assistant",
         }
         marker = markers.get(self.template, "[/INST]")
         idx = raw.rfind(marker)
-        if idx != -1:
-            return raw[idx + len(marker):].strip()
-        return raw.strip()
+        text = raw[idx + len(marker):].strip() if idx != -1 else raw.strip()
+        return _strip_think_blocks(text)
 
     def load_llm(self, log: logging.Logger,
                  n_ctx_override: Optional[int] = None) -> Llama:
@@ -1055,10 +1078,10 @@ def strip_prompt_echo(raw: str, prompt: str,
     for marker in ("[/INST]", "<|im_start|>assistant", "<|start_header_id|>assistant"):
         idx = raw.rfind(marker)
         if idx != -1:
-            return raw[idx + len(marker):].strip()
+            return _strip_think_blocks(raw[idx + len(marker):].strip())
     if raw.startswith(prompt[:50]):
-        return raw[len(prompt):].strip()
-    return raw.strip()
+        return _strip_think_blocks(raw[len(prompt):].strip())
+    return _strip_think_blocks(raw.strip())
 
 
 def parse_batch_response(raw: str, expected: int,
